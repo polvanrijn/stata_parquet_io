@@ -12,6 +12,7 @@ pub mod sql_from_if;
 pub mod utilities;
 pub mod downcast;
 pub mod fast_cache;
+pub mod parquet_metadata;
 
 use std::ptr;
 

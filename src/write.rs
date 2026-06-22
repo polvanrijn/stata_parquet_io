@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
 use std::fs::File;
-use polars::prelude::{NamedFrom, TimeUnit};
+use polars::prelude::{KeyValueMetadata, NamedFrom, TimeUnit};
 use polars::prelude::*;
 use polars_sql::SQLContext;
 use rayon::prelude::*;
@@ -16,7 +16,8 @@ use crate::stata_interface::{
     display,
     get_macro
 };
-use crate::mapping::{self, StataColumnInfo};
+use crate::mapping::{self, StataColumnInfo, StataValueLabel};
+use crate::parquet_metadata::stata_variable_metadata_json;
 
 use crate::utilities::{
     DAY_SHIFT_SAS_STATA,
@@ -118,6 +119,7 @@ pub fn write_from_stata(
     };
     //    println!("columns     = {:?}", all_columns);
     //    println!("column info = {:?}", column_info);
+    let parquet_metadata_json = stata_variable_metadata_json(&column_info);
 
     // Convert Option<&str> to Option<String>
     let sql_if_owned = sql_if.map(|s| s.to_string());
@@ -163,7 +165,8 @@ pub fn write_from_stata(
                 compress,
                 compress_string,
                 quietly,
-                append_to_partition
+                append_to_partition,
+                parquet_metadata_json.as_deref()
             )
         } else {
             save_no_partition(
@@ -173,7 +176,8 @@ pub fn write_from_stata(
                 compression_level,
                 compress,
                 compress_string,
-                quietly
+                quietly,
+                parquet_metadata_json.as_deref()
             )
         }
     } else {
@@ -275,6 +279,7 @@ fn save_partitioned(
     compress_string: bool,
     quietly: bool,
     append_to_partition: bool,
+    metadata_json: Option<&str>,
 )  -> Result<i32,Box<dyn Error>> {
     let mut df = match lf.collect() {
         Err(e) => {
@@ -320,6 +325,7 @@ fn save_partitioned(
         false,
         quietly,
         append_to_partition,
+        metadata_json,
     )
 
     // let partition_variant = PartitionVariant::ByKey {
@@ -397,9 +403,10 @@ fn save_partitioned_sequential(
     compress_string: bool,
     quietly: bool,
     append_to_partition: bool,
+    metadata_json: Option<&str>,
 ) -> Result<i32, Box<dyn Error>> {
-    let pqo = parquet_options(compression, compression_level);
-    
+    let pqo = parquet_options(compression, compression_level, metadata_json);
+
     // First, get unique partition values by collecting only the partition columns
     let partition_values_df = lf.clone()
         .select(partition_by.iter().map(|col_name| col(col_name.clone())).collect::<Vec<_>>())
@@ -621,7 +628,7 @@ pub fn consolidate_parquet_dir(path: &str) -> Result<i32, Box<dyn Error>> {
     // Write to a temp file next to the directory, then swap
     let temp_path = format!("{}_consolidating.parquet", path);
 
-    let pqo = parquet_options("zstd", None);
+    let pqo = parquet_options("zstd", None, None);
     let mut df = match lf.collect() {
         Ok(df) => df,
         Err(e) => {
@@ -690,6 +697,7 @@ fn save_no_partition(
     compress:bool,
     compress_string: bool,
     quietly: bool,
+    metadata_json: Option<&str>,
 ) -> Result<i32,Box<dyn Error>> {
 
     if compress | compress_string {
@@ -721,7 +729,7 @@ fn save_no_partition(
     }
 
 
-    let pqo = parquet_options(compression, compression_level);
+    let pqo = parquet_options(compression, compression_level, metadata_json);
     match lf.collect() {
         Err(e) => {
             display(&format!("Parquet collect error: {}", e));
@@ -751,6 +759,7 @@ fn save_no_partition(
 fn parquet_options(
     compression:&str,
     compression_level:Option<usize>,
+    metadata_json: Option<&str>,
 ) -> ParquetWriteOptions {
     let mut pqo = ParquetWriteOptions::default();
     pqo.compression = match compression {
@@ -783,6 +792,12 @@ fn parquet_options(
             ParquetCompression::Zstd(zstd_level)
         }
     };
+
+    if let Some(json) = metadata_json {
+        pqo.key_value_metadata = Some(KeyValueMetadata::from_static(vec![
+            ("stata.variable_metadata".to_string(), json.to_string()),
+        ]));
+    }
 
     pqo
 }
@@ -850,12 +865,40 @@ fn column_info_from_macros(
         let stata_col_str = get_macro(&format!("col_{}", i+1), false, None);
         let stata_col = stata_col_str.parse::<usize>().unwrap_or(0);
 
+        let variable_label = get_macro(&format!("variable_label_{}", i+1), false, Some(1024 * 1024));
+        let note_count = get_macro(&format!("note_count_{}", i+1), false, None)
+            .parse::<usize>()
+            .unwrap_or(0);
+        let notes = (1..=note_count)
+            .map(|j| get_macro(&format!("note_{}_{}", i+1, j), false, Some(1024 * 1024)))
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>();
+        let value_label_name = get_macro(&format!("value_label_name_{}", i+1), false, None);
+        let value_label_count = get_macro(&format!("value_label_count_{}", i+1), false, None)
+            .parse::<usize>()
+            .unwrap_or(0);
+        let value_labels = (1..=value_label_count)
+            .filter_map(|j| {
+                let value = get_macro(&format!("value_label_value_{}_{}", i+1, j), false, None);
+                let label = get_macro(&format!("value_label_text_{}_{}", i+1, j), false, Some(1024 * 1024));
+                if label.is_empty() {
+                    None
+                } else {
+                    Some(StataValueLabel { value, label })
+                }
+            })
+            .collect::<Vec<_>>();
+
         column_infos.push(StataColumnInfo {
             name,
             dtype,
             format,
             str_length,
             stata_col,
+            variable_label,
+            notes,
+            value_label_name,
+            value_labels,
         });
     }
     

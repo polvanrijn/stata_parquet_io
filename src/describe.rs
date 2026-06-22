@@ -8,6 +8,7 @@ use glob::glob;
 
 use crate::fast_cache::{self, FastCacheKey, resolve_varlist};
 use crate::mapping::{is_string_type, schema_with_stata_types};
+use crate::parquet_metadata::read_stata_variable_metadata;
 use crate::stata_interface::{
     ST_retcode,
     display,
@@ -350,6 +351,12 @@ pub fn file_summary(
         if detailed { Some(&string_lengths) } else { None },
     );
 
+    if matches!(input_format, InputFormat::Parquet) {
+        set_stata_metadata_macros(path, &matched_cols);
+    } else {
+        clear_stata_metadata_macros(matched_cols.len());
+    }
+
     let n_vars = matched_schema.len();
     
     //  Return scalars of the number of columns and rows 
@@ -382,6 +389,65 @@ pub fn file_summary(
     }
 
     return 0 as ST_retcode;
+}
+
+fn set_stata_metadata_macros(path: &str, matched_cols: &[String]) {
+    let metadata = read_stata_variable_metadata(path);
+    set_macro("stata_metadata_present", if metadata.is_empty() { "0" } else { "1" }, false);
+
+    for (idx, name) in matched_cols.iter().enumerate() {
+        let i = idx + 1;
+        let info = metadata.get(name);
+        set_macro(
+            &format!("stata_label_{}", i),
+            info.map(|m| m.label.as_str()).unwrap_or(""),
+            false,
+        );
+        set_macro(
+            &format!("stata_comment_{}", i),
+            info.map(|m| m.comment.as_str()).unwrap_or(""),
+            false,
+        );
+        set_macro(
+            &format!("stata_format_{}", i),
+            info.map(|m| m.format.as_str()).unwrap_or(""),
+            false,
+        );
+        set_macro(
+            &format!("stata_declared_type_{}", i),
+            info.map(|m| m.stata_type.as_str()).unwrap_or(""),
+            false,
+        );
+        set_macro(
+            &format!("stata_value_label_name_{}", i),
+            info.map(|m| m.value_label_name.as_str()).unwrap_or(""),
+            false,
+        );
+        let value_labels = info.map(|m| m.value_labels.as_slice()).unwrap_or(&[]);
+        set_macro(&format!("stata_value_label_count_{}", i), &value_labels.len().to_string(), false);
+        for (j, item) in value_labels.iter().enumerate() {
+            set_macro(&format!("stata_value_label_value_{}_{}", i, j + 1), &item.value, false);
+            set_macro(&format!("stata_value_label_text_{}_{}", i, j + 1), &item.label, false);
+        }
+        let notes = info.map(|m| m.notes.as_slice()).unwrap_or(&[]);
+        set_macro(&format!("stata_note_count_{}", i), &notes.len().to_string(), false);
+        for (j, note) in notes.iter().enumerate() {
+            set_macro(&format!("stata_note_{}_{}", i, j + 1), note, false);
+        }
+    }
+}
+
+fn clear_stata_metadata_macros(n_cols: usize) {
+    set_macro("stata_metadata_present", "0", false);
+    for i in 1..=n_cols {
+        set_macro(&format!("stata_label_{}", i), "", false);
+        set_macro(&format!("stata_comment_{}", i), "", false);
+        set_macro(&format!("stata_format_{}", i), "", false);
+        set_macro(&format!("stata_declared_type_{}", i), "", false);
+        set_macro(&format!("stata_value_label_name_{}", i), "", false);
+        set_macro(&format!("stata_value_label_count_{}", i), "0", false);
+        set_macro(&format!("stata_note_count_{}", i), "0", false);
+    }
 }
 
 fn collect_row_count_and_string_lengths(

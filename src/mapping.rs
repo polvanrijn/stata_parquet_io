@@ -141,6 +141,20 @@ pub struct StataColumnInfo {
     pub str_length: usize,
     #[serde(default)]
     pub stata_col: usize,  // 1-based position in the Stata dataset; 0 = unset (use enumerate index)
+    #[serde(default)]
+    pub variable_label: String,
+    #[serde(default)]
+    pub notes: Vec<String>,
+    #[serde(default)]
+    pub value_label_name: String,
+    #[serde(default)]
+    pub value_labels: Vec<StataValueLabel>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct StataValueLabel {
+    pub value: String,
+    pub label: String,
 }
 
 pub fn stata_column_info_to_schema(

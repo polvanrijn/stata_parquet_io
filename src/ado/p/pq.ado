@@ -657,6 +657,19 @@ program pq_use_append
 		local type `type_`var_number''
 		local string_length `string_length_`var_number''
 
+		//	If pq save embedded original Stata storage metadata, prefer it over
+		//	the inferred Parquet storage type where safe.
+		if ("`source_format'" == "parquet" & "`stata_metadata_present'" == "1") {
+			local declared_type `"`stata_declared_type_`var_number''"'
+			if inlist("`declared_type'", "byte", "int", "long", "float", "double") {
+				local type `declared_type'
+			}
+			else if regexm("`declared_type'", "^str([0-9]+)$") {
+				local type string
+				local string_length = max(`string_length', real(regexs(1)))
+			}
+		}
+
 		//	Set rename_to to nothing
 		local rename_to
 
@@ -685,7 +698,8 @@ program pq_use_append
 				local rename_list `rename_list' `name_to_create'
 				local rename_count = `rename_count' + 1
 				local rename_from_`rename_count' `vari'
-				label variable `name_to_create' "{parquet_name:`vari'}"
+				capture 			capture 				capture 						capture capture char `name_to_create'[pq_parquet_name] `"`vari'"'
+
 			}
 			//	Don't add strL to match_vars_non_binary - they're not sent to read plugin
 			continue
@@ -716,7 +730,9 @@ program pq_use_append
 			local rename_count = `rename_count' + 1
 			local rename_from_`rename_count' `vari'
 
-			label variable `name_to_create' "{parquet_name:`vari'}"
+							capture 			capture 				capture 						capture capture char `name_to_create'[pq_parquet_name] `"`vari'"'
+
+
 		}
 
 		if (`keep') {
@@ -833,6 +849,74 @@ program pq_use_append
 			}
 		}
 		capture order `ordered_vars'
+	}
+
+	//	Apply Stata metadata embedded in parquet key/value metadata.
+	//	Rust sets stata_label_#, stata_comment_#, and stata_format_# during describe.
+	if ("`source_format'" == "parquet" & "`stata_metadata_present'" == "1") {
+		foreach vari in `matched_vars' {
+			local var_number: list posof "`vari'" in vars_in_file
+			if (`var_number' <= 0) continue
+
+			local final_name `vari'
+			forvalues ri = 1/`rename_count' {
+				if ("`vari'" == "`rename_from_`ri''") {
+					local pos : list posof "`rename_from_`ri''" in rename_list
+					if (`pos' > 0) {
+						local final_name : word `pos' of `rename_list'
+					}
+					continue, break
+				}
+			}
+
+			capture confirm variable `final_name', exact
+			if (_rc) continue
+
+			local metadata_label `"`stata_label_`var_number''"'
+			if (`"`metadata_label'"' != "") {
+				capture label variable `final_name' `"`metadata_label'"'
+			}
+
+			local metadata_format `"`stata_format_`var_number''"'
+			if (`"`metadata_format'"' != "") {
+				capture format `final_name' `metadata_format'
+			}
+
+			local note_count = real("0`stata_note_count_`var_number''")
+			if (`note_count' > 0) {
+				capture notes drop `final_name'
+				forvalues ni = 1/`note_count' {
+					local metadata_note `"`stata_note_`var_number'_`ni''"'
+					if (`"`metadata_note'"' != "") {
+						capture notes `final_name': `"`metadata_note'"'
+					}
+				}
+			}
+			else {
+				local metadata_comment `"`stata_comment_`var_number''"'
+				if (`"`metadata_comment'"' != "") {
+					capture notes drop `final_name'
+					capture notes `final_name': `"`metadata_comment'"'
+				}
+			}
+
+			local metadata_value_label_name `"`stata_value_label_name_`var_number''"'
+			local value_label_count = real("0`stata_value_label_count_`var_number''")
+			if (`"`metadata_value_label_name'"' != "" & `value_label_count' > 0) {
+				capture confirm numeric variable `final_name'
+				if (!_rc) {
+					capture label drop `metadata_value_label_name'
+					forvalues vli = 1/`value_label_count' {
+						local vlvalue `"`stata_value_label_value_`var_number'_`vli''"'
+						local vltext `"`stata_value_label_text_`var_number'_`vli''"'
+						if (`"`vlvalue'"' != "" & `"`vltext'"' != "") {
+							capture label define `metadata_value_label_name' `vlvalue' `"`vltext'"', modify
+						}
+					}
+					capture label values `final_name' `metadata_value_label_name'
+				}
+			}
+		}
 	}
 
 	//	BATCH 2: Overflow rows via .dta append (if batching was needed)
@@ -1241,24 +1325,50 @@ program pq_save
 		local str_length_`var_count' `str_length'
 		local col_`var_count' : list posof "`vari'" in _all_variables_ordered
 		
+		local variable_label_`var_count' : variable label `vari'
+		local note_count_`var_count' 0
+		local note0_`var_count' : char `vari'[note0]
+		if (`"`note0_`var_count''"' != "") {
+			local note_count_`var_count' = real("`note0_`var_count''")
+			forvalues ni = 1/`note_count_`var_count'' {
+				local note_`var_count'_`ni' : char `vari'[note`ni']
+			}
+		}
+		local value_label_name_`var_count' : value label `vari'
+		local value_label_count_`var_count' 0
+		if (`"`value_label_name_`var_count''"' != "") {
+			capture confirm numeric variable `vari'
+			if (!_rc) {
+				quietly levelsof `vari' if !missing(`vari'), local(_pq_value_label_values)
+				foreach _pq_vl_value of local _pq_value_label_values {
+					local _pq_vl_text : label (`value_label_name_`var_count'') `_pq_vl_value'
+					if (`"`_pq_vl_text'"' != `"`_pq_vl_value'"') {
+						local value_label_count_`var_count' = `value_label_count_`var_count'' + 1
+						local _pq_vl_idx = `value_label_count_`var_count''
+						local value_label_value_`var_count'_`_pq_vl_idx' `_pq_vl_value'
+						local value_label_text_`var_count'_`_pq_vl_idx' `"`_pq_vl_text'"'
+					}
+				}
+			}
+		}
+
 		//	Rename?
 		if ("`noautorename'" == "") {
-			//	capture: labels with backticks (e.g. `87) cause r(132) "too few quotes"
-			//	when expanded inside compound quotes -- silently skip rename check
+			local parquet_namei : char `vari'[pq_parquet_name]
+			if (`"`parquet_namei'"' == "") {
+				//	Backward compatibility with older pq imports that stored the original
+				//	Parquet column name in the variable label.
+				local labeli: variable label `vari'
+				local labeli: subinstr local labeli "\`" "'", all
+				if regexm(`"`labeli'"', "^\{parquet_name:([^}]*)\}") {
+					local parquet_namei = regexs(1)
+				}
+			}
 
-			local labeli: variable label `vari'
-			local labeli: subinstr local labeli "\`" "'", all
-
-			if regexm(`"`labeli'"', "^\{parquet_name:([^}]*)\}") {
-				//	Extract the value between "parquet_name:" and "}"
-
+			if (`"`parquet_namei'"' != "") {
 				local n_rename = `n_rename' + 1
 				local rename_from_`n_rename' `vari'
-				local rename_to_`n_rename' = regexs(1)
-
-				//	di "n_rename: `n_rename'"
-				//	di "	from: `rename_from_`n_rename''"
-				//	di "	to:   `rename_to_`n_rename''"
+				local rename_to_`n_rename' `"`parquet_namei'"'
 			}
 		}
 	}
