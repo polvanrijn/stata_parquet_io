@@ -891,8 +891,11 @@ program pq_use_append
 				capture notes drop `final_name'
 				forvalues ni = 1/`note_count' {
 					local metadata_note `"`stata_note_`var_number'_`ni''"'
+					//	`notes var: text' stores the rest of the line verbatim, so
+					//	the text must NOT be wrapped in (compound) quotes -- those
+					//	characters would be stored as part of the note.
 					if (`"`metadata_note'"' != "") {
-						capture notes `final_name': `"`metadata_note'"'
+						capture notes `final_name': `metadata_note'
 					}
 				}
 			}
@@ -900,7 +903,7 @@ program pq_use_append
 				local metadata_comment `"`stata_comment_`var_number''"'
 				if (`"`metadata_comment'"' != "") {
 					capture notes drop `final_name'
-					capture notes `final_name': `"`metadata_comment'"'
+					capture notes `final_name': `metadata_comment'
 				}
 			}
 
