@@ -628,7 +628,10 @@ pub fn consolidate_parquet_dir(path: &str) -> Result<i32, Box<dyn Error>> {
     // Write to a temp file next to the directory, then swap
     let temp_path = format!("{}_consolidating.parquet", path);
 
-    let pqo = parquet_options("zstd", None, None);
+    // Preserve any embedded Stata variable metadata that the partition files carry.
+    let metadata_json =
+        crate::parquet_metadata::read_stata_variable_metadata_raw(path);
+    let pqo = parquet_options("zstd", None, metadata_json.as_deref());
     let mut df = match lf.collect() {
         Ok(df) => df,
         Err(e) => {

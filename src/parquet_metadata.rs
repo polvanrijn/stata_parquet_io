@@ -302,6 +302,14 @@ fn read_parquet_key_value_metadata(path: &str) -> Option<HashMap<String, String>
     }
 }
 
+/// Returns the raw `stata.variable_metadata` JSON string embedded in a parquet
+/// file/dataset, if present. Used to carry metadata through operations (such as
+/// directory consolidation) that rewrite the file.
+pub fn read_stata_variable_metadata_raw(path: &str) -> Option<String> {
+    let kv = read_parquet_key_value_metadata(path)?;
+    kv.get("stata.variable_metadata").cloned()
+}
+
 pub fn read_stata_variable_metadata(path: &str) -> HashMap<String, StataMetadata> {
     let Some(kv) = read_parquet_key_value_metadata(path) else {
         return HashMap::new();

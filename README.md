@@ -114,3 +114,9 @@ Benchmarks run on AMD Ryzen 7 8845HS, 14 GB RAM, Windows 11, Stata 17 SE. See [b
 - **strL reads** are slower than `str#` due to Stata plugin constraints.
 - **`if()` uses SQL semantics**: missing values are not treated as greater than any value (unlike Stata's native `if`).
 - **CSV date filters**: use ISO literals (`DATE '2020-01-05'`) rather than Stata's `td()`/`tc()` functions inside `if()`.
+
+## Building from source
+
+See [BUILDING.md](BUILDING.md) for native builds, cross-compiling to Windows
+from macOS/Linux (via `cargo-xwin`, no Windows machine required), and the CI
+release workflow.

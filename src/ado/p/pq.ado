@@ -1,5 +1,9 @@
 *! pq - read/write parquet files with stata
-*! Version 3.0.7 - Fix for write subset of variables, support for arrow extension types
+*! Version 3.1.0 - Round-trip Stata variable metadata (labels, value labels, notes,
+*!				   formats, storage types) through parquet key/value metadata.
+*!				   Preserve metadata on directory consolidation; capture full value
+*!				   label definitions (including unused values).
+*!         3.0.7 - Fix for write subset of variables, support for arrow extension types
 *!				   Fix for relaxed on directory read
 *!				   Auto infer file format on pq read-like
 *!         3.0.6 - Update underlying rust library for better SPSS write compatibility
@@ -698,7 +702,7 @@ program pq_use_append
 				local rename_list `rename_list' `name_to_create'
 				local rename_count = `rename_count' + 1
 				local rename_from_`rename_count' `vari'
-				capture 			capture 				capture 						capture capture char `name_to_create'[pq_parquet_name] `"`vari'"'
+				capture char `name_to_create'[pq_parquet_name] `"`vari'"'
 
 			}
 			//	Don't add strL to match_vars_non_binary - they're not sent to read plugin
@@ -730,7 +734,7 @@ program pq_use_append
 			local rename_count = `rename_count' + 1
 			local rename_from_`rename_count' `vari'
 
-							capture 			capture 				capture 						capture capture char `name_to_create'[pq_parquet_name] `"`vari'"'
+							capture char `name_to_create'[pq_parquet_name] `"`vari'"'
 
 
 		}
@@ -1339,16 +1343,11 @@ program pq_save
 		if (`"`value_label_name_`var_count''"' != "") {
 			capture confirm numeric variable `vari'
 			if (!_rc) {
-				quietly levelsof `vari' if !missing(`vari'), local(_pq_value_label_values)
-				foreach _pq_vl_value of local _pq_value_label_values {
-					local _pq_vl_text : label (`value_label_name_`var_count'') `_pq_vl_value'
-					if (`"`_pq_vl_text'"' != `"`_pq_vl_value'"') {
-						local value_label_count_`var_count' = `value_label_count_`var_count'' + 1
-						local _pq_vl_idx = `value_label_count_`var_count''
-						local value_label_value_`var_count'_`_pq_vl_idx' `_pq_vl_value'
-						local value_label_text_`var_count'_`_pq_vl_idx' `"`_pq_vl_text'"'
-					}
-				}
+				//	Enumerate the FULL value-label definition (every mapping,
+				//	including values that do not appear in the data) so nothing is
+				//	lost on the round trip.  Sets value_label_count_# and the
+				//	value_label_value_#_# / value_label_text_#_# locals.
+				mata: pq_collect_value_labels(`var_count', "`value_label_name_`var_count''")
 			}
 		}
 
@@ -1791,4 +1790,32 @@ program define pq_convert_path, rclass
     
     // Return the full path
     return local fullpath "`fullpath'"
+end
+
+
+//	--------------------------------------------------------------------------
+//	Mata helper: dump the full contents of a value label into the locals that
+//	pq_save sends to the plugin (value_label_count_#, value_label_value_#_#,
+//	value_label_text_#_#).  Enumerates every defined mapping, not just the
+//	values present in the data.
+//	--------------------------------------------------------------------------
+version 16.0
+mata:
+void pq_collect_value_labels(real scalar vc, string scalar lname)
+{
+	real colvector   vals
+	string colvector txts
+	real scalar      i, n
+
+	if (lname == "" | st_vlexists(lname) == 0) return
+	st_vlload(lname, vals, txts)
+	n = rows(vals)
+	st_local("value_label_count_" + strofreal(vc), strofreal(n))
+	for (i = 1; i <= n; i++) {
+		st_local("value_label_value_" + strofreal(vc) + "_" + strofreal(i),
+		         strofreal(vals[i], "%18.0g"))
+		st_local("value_label_text_" + strofreal(vc) + "_" + strofreal(i),
+		         txts[i])
+	}
+}
 end
