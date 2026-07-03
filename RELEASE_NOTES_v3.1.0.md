@@ -28,6 +28,17 @@ extra key.
   (via a Mata `st_vlload` helper).
 - **Cleaned up corrupted `char … [pq_parquet_name]` statements** in the rename
   path (repeated `capture` tokens introduced by an earlier edit).
+- **Fixed note text on read.** Notes were re-applied with `notes var: `"text"'`;
+  because `notes` stores the rest of the line verbatim, the quote delimiters
+  ended up inside the note. Notes now round-trip exactly.
+
+## Python interoperability
+
+The metadata is a plain JSON blob under the Parquet key `stata.variable_metadata`,
+so you can produce Stata-ready Parquet from Python (and read it back):
+
+- `examples/python_stata_metadata.py` — write/read the metadata with pyarrow.
+- `examples/python_roundtrip.do` — Python-made parquet → `pq use` → `pq save`.
 
 ## Known limitations
 
