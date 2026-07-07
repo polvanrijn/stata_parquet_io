@@ -32,6 +32,18 @@ extra key.
   because `notes` stores the rest of the line verbatim, the quote delimiters
   ended up inside the note. Notes now round-trip exactly.
 
+## Fixes since 3.1.0
+
+- **Metadata is now visible to pyarrow/pandas, not just `pq use`.** Stata-written
+  Parquet embedded `stata.variable_metadata` only as a file-level key/value pair.
+  Polars regenerates the `ARROW:schema` footer key from the frame schema (which
+  carries no metadata), so Arrow-based readers — `pyarrow.parquet.read_schema().metadata`,
+  pandas, polars — reconstructed the schema from `ARROW:schema` and never saw the
+  Stata metadata (`read_stata_metadata()` returned `{}` for a Stata-resaved file).
+  The metadata is now also embedded inside the Arrow schema itself, so it survives
+  the full `Python → pq use → pq save → Python` round trip. The file-level key is
+  still written, so `pq use` is unaffected.
+
 ## Python interoperability
 
 The metadata is a plain JSON blob under the Parquet key `stata.variable_metadata`,
