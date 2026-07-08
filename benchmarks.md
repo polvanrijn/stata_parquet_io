@@ -3,7 +3,7 @@
 Generated with polars-readstat-rs 0.9.4. All times in seconds (avg per rep).
 
 ---
-
+ 
 ## Parquet vs Stata `.dta`
 
 10 variables (1 int, 1 str, 8 float). Single rep per cell.

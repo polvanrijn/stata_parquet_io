@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::path::Path;
 use polars_parquet::write::{BrotliLevel, GzipLevel, ZstdLevel};
+use polars_parquet::arrow::write::schema_to_metadata_key;
 
 use crate::{downcast, stata_interface};
 use crate::stata_interface::{
@@ -405,7 +406,7 @@ fn save_partitioned_sequential(
     append_to_partition: bool,
     metadata_json: Option<&str>,
 ) -> Result<i32, Box<dyn Error>> {
-    let pqo = parquet_options(compression, compression_level, metadata_json);
+    let mut pqo = parquet_options(compression, compression_level);
 
     // First, get unique partition values by collecting only the partition columns
     let partition_values_df = lf.clone()
@@ -545,6 +546,7 @@ fn save_partitioned_sequential(
         // Generate a unique filename for this partition
         let file_idx = if append_to_partition { next_partition_file_index(&partition_dir) } else { 0 };
         let partition_file = partition_dir.join(format!("data_{}.parquet", file_idx));
+        set_stata_metadata(&mut pqo, partition_df.schema(), metadata_json);
         let file = File::create(&partition_file).map_err(|e| {
             display(&format!("Partition file create error for {}: {}", partition_dir.display(), e));
             e
@@ -631,7 +633,7 @@ pub fn consolidate_parquet_dir(path: &str) -> Result<i32, Box<dyn Error>> {
     // Preserve any embedded Stata variable metadata that the partition files carry.
     let metadata_json =
         crate::parquet_metadata::read_stata_variable_metadata_raw(path);
-    let pqo = parquet_options("zstd", None, metadata_json.as_deref());
+    let mut pqo = parquet_options("zstd", None);
     let mut df = match lf.collect() {
         Ok(df) => df,
         Err(e) => {
@@ -639,6 +641,7 @@ pub fn consolidate_parquet_dir(path: &str) -> Result<i32, Box<dyn Error>> {
             return Ok(198);
         }
     };
+    set_stata_metadata(&mut pqo, df.schema(), metadata_json.as_deref());
 
     let file = File::create(&temp_path)?;
     if let Err(e) = pqo.to_writer(file).finish(&mut df) {
@@ -732,13 +735,14 @@ fn save_no_partition(
     }
 
 
-    let pqo = parquet_options(compression, compression_level, metadata_json);
+    let mut pqo = parquet_options(compression, compression_level);
     match lf.collect() {
         Err(e) => {
             display(&format!("Parquet collect error: {}", e));
             Ok(198)
         },
         Ok(mut df) => {
+            set_stata_metadata(&mut pqo, df.schema(), metadata_json);
             let file = match File::create(path) {
                 Ok(f) => f,
                 Err(e) => {
@@ -762,7 +766,6 @@ fn save_no_partition(
 fn parquet_options(
     compression:&str,
     compression_level:Option<usize>,
-    metadata_json: Option<&str>,
 ) -> ParquetWriteOptions {
     let mut pqo = ParquetWriteOptions::default();
     pqo.compression = match compression {
@@ -796,13 +799,56 @@ fn parquet_options(
         }
     };
 
-    if let Some(json) = metadata_json {
-        pqo.key_value_metadata = Some(KeyValueMetadata::from_static(vec![
-            ("stata.variable_metadata".to_string(), json.to_string()),
-        ]));
-    }
-
     pqo
+}
+
+/// Key under which Stata variable metadata is embedded in the Parquet footer.
+const STATA_METADATA_KEY: &str = "stata.variable_metadata";
+
+/// Build the key/value metadata to embed in a Parquet file so that the Stata
+/// variable metadata survives *both* our own reader and external Arrow-based
+/// readers (pyarrow/pandas/polars).
+///
+/// The metadata is written in two places:
+///   1. As a plain file-level key/value pair (`stata.variable_metadata`), which
+///      is what `pq use` reads back.
+///   2. Embedded in the Arrow schema (the `ARROW:schema` IPC blob), because
+///      pyarrow's `read_schema().metadata` and pandas surface *that* metadata,
+///      not arbitrary file-level pairs. Polars would otherwise regenerate the
+///      `ARROW:schema` key from the (metadata-less) frame schema and drop ours;
+///      pre-supplying an `ARROW:schema` entry makes polars keep ours instead.
+fn stata_key_value_metadata(schema: &Schema, json: &str) -> KeyValueMetadata {
+    // Reconstruct the Arrow schema polars would write, then attach the Stata
+    // metadata at the schema level so it lands inside the ARROW:schema blob.
+    let mut arrow_schema: ArrowSchema = schema
+        .iter()
+        .map(|(name, dtype)| {
+            let field = dtype.to_arrow_field(name.clone(), CompatLevel::newest());
+            (field.name.clone(), field)
+        })
+        .collect();
+    arrow_schema
+        .metadata_mut()
+        .insert(STATA_METADATA_KEY.into(), json.into());
+
+    let mut entries: Vec<(String, String)> = Vec::with_capacity(2);
+    let arrow_kv = schema_to_metadata_key(&arrow_schema);
+    if let Some(value) = arrow_kv.value {
+        entries.push((arrow_kv.key, value));
+    }
+    entries.push((STATA_METADATA_KEY.to_string(), json.to_string()));
+    KeyValueMetadata::from_static(entries)
+}
+
+/// Set the embedded Stata metadata on `pqo` for the given frame `schema`.
+fn set_stata_metadata(
+    pqo: &mut ParquetWriteOptions,
+    schema: &Schema,
+    metadata_json: Option<&str>,
+) {
+    if let Some(json) = metadata_json {
+        pqo.key_value_metadata = Some(stata_key_value_metadata(schema, json));
+    }
 }
 
 fn get_rename_list() -> HashMap<PlSmallStr,PlSmallStr> {
