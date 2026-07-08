@@ -1,5 +1,7 @@
 *! pq - read/write parquet files with stata
-*! Version 3.1.0 - Round-trip Stata variable metadata (labels, value labels, notes,
+*! Version 3.1.1 - Embed Stata variable metadata in the Arrow schema so it is
+*!				   visible to pyarrow/pandas/polars (not only to `pq use`).
+*!         3.1.0 - Round-trip Stata variable metadata (labels, value labels, notes,
 *!				   formats, storage types) through parquet key/value metadata.
 *!				   Preserve metadata on directory consolidation; capture full value
 *!				   label definitions (including unused values).

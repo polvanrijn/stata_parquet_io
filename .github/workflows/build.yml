@@ -137,11 +137,15 @@ jobs:
 
           if [ "${{ matrix.config.platform_name }}" = "windows" ]; then
             cp target/${{ matrix.config.target }}/release/stata_parquet_io.${{ matrix.config.extension }} release_package/pq.${{ matrix.config.extension }}
+            # Stata loads `pq.plugin` first (see pq_register_plugin); ship it ready to use.
+            cp release_package/pq.${{ matrix.config.extension }} release_package/pq.plugin
           elif [ "${{ matrix.config.platform_name }}" = "macos" ]; then
             # Copy Intel and ARM binaries separately
             cp target/x86_64-apple-darwin/release/libstata_parquet_io.${{ matrix.config.extension }} release_package/pq_intel.dylib
             cp target/aarch64-apple-darwin/release/libstata_parquet_io.${{ matrix.config.extension }} release_package/pq_arm.dylib
-            
+            # Universal binary named `pq.plugin` so it loads on both Intel and Apple Silicon.
+            lipo -create release_package/pq_intel.dylib release_package/pq_arm.dylib -output release_package/pq.plugin
+
             echo "macOS binaries:"
             ls -la release_package/
           elif [ "${{ matrix.config.platform_name }}" = "linux" ]; then
@@ -154,6 +158,8 @@ jobs:
               ls -la target/${{ matrix.config.target }}/release/
               exit 1
             fi
+            # Stata loads `pq.plugin` first (see pq_register_plugin); ship it ready to use.
+            cp release_package/pq.${{ matrix.config.extension }} release_package/pq.plugin
 
             echo "Checking library dependencies:"
             ldd release_package/pq.${{ matrix.config.extension }} || echo "ldd unavailable"
