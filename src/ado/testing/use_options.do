@@ -104,6 +104,10 @@ assert `n_diff' == 0
 pq use * using "`tparquet'.parquet", clear compress
 assert _N == 100000
 local c4type: type c_4
+//	c_4 = floor(runiform()*100), i.e. 0-99: fits Stata byte exactly. compress
+//	used to report this one level wider ("int") because the type label was
+//	computed from the pre-narrowing default mapping instead of the type
+//	compress itself had already picked - fixed to report the real type.
 assert "`c4type'" == "byte"
 describe
 sum

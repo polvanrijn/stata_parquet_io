@@ -1,10 +1,16 @@
 *! pq - read/write parquet files with stata
-*! Version 3.1.1 - Embed Stata variable metadata in the Arrow schema so it is
-*!				   visible to pyarrow/pandas/polars (not only to `pq use`).
-*!         3.1.0 - Round-trip Stata variable metadata (labels, value labels, notes,
-*!				   formats, storage types) through parquet key/value metadata.
-*!				   Preserve metadata on directory consolidation; capture full value
-*!				   label definitions (including unused values).
+*! Version 4.0.4 - Write strings as large_string (not string_view) for R arrow compatibility
+*!         4.0.3 - Fix memory spike issues on hive partitions and subset loads
+*! 		   4.0.2 - Allow limit core usage with pq set_threads
+*!         4.0.1 - Add Stata metadata round-tripping (variable/value labels, notes, formats,
+*!                 characteristics) through `pq save`/`pq use`. Faster `pq use`: batched variable
+*!                 allocation cuts load time up to ~4x on large files and ~7x on wide files
+*!                 (see benchmarks.md).  Add metadata roundtrip of stata types.
+*!         3.0.9 - Add safe_int64 option: error (naming columns) when Int64/UInt64 values exceed
+*!                 +/-2^53 and would silently lose precision as a Stata double; safe_int64 auto-loads
+*!                 the affected columns as strings instead of erroring.
+*!                 Also fix regression to properly read columns with names longer than 32 characters.
+*!         3.0.8 - Fix overflow/null regression (cast to larger type to avoid losing values to reserved nulls)
 *!         3.0.7 - Fix for write subset of variables, support for arrow extension types
 *!				   Fix for relaxed on directory read
 *!				   Auto infer file format on pq read-like
@@ -94,6 +100,12 @@ program define pq
 	else if ("`todo'" == "path") {
 		//	di `"pq_convert_path `0'"'
 		pq_convert_path `0'
+	}
+	else if ("`todo'" == "metadata") {
+		pq_metadata `0'
+	}
+	else if ("`todo'" == "set_threads") {
+		pq_set_threads `0'
 	}
     else {
         disp as err `"Unknown sub-comand `todo'"'
@@ -304,7 +316,7 @@ program pq_merge
 												drop(`drop')					///
 												`drop_strl'
 		quietly save `t_save'
-		sum
+		//	sum
 	}
 	/*
 	di `"merge `origmtype' `varlist_n'`varlist' using "`t_save'",	gen(`generate') 	///"'
@@ -385,7 +397,10 @@ program pq_use_append
 						append				///
 						cast(string asis)		///
 						lax				///
-						binary_to_string]
+						safe_int64			///
+						binary_to_string	///
+						NOSTATAMETADATA	///
+						metadata_only]
 
 	local pq_namelist_buf `"`namelist'"'
 		
@@ -402,7 +417,57 @@ program pq_use_append
 	
 	local b_append = "`append'" != ""
 
-	
+	//	Snapshot of variables that existed before this call, so statametadata
+	//	restoration on append only touches newly created variables and never
+	//	overwrites labels/value-labels/notes a user already set on existing
+	//	ones. Empty for a plain (non-append) use, so every loaded variable
+	//	counts as "new" there.
+	local pq_meta_preexisting_vars
+	if (`b_append') {
+		unab pq_meta_preexisting_vars : _all
+	}
+
+	//	metadata_only skips the whole data-read pipeline below and just
+	//	applies the footer's Stata metadata to whatever is already loaded,
+	//	matched by variable name. `local' scope in Stata is per-program, not
+	//	per-brace-block, so the pq_meta_* macros this plugin call stages,
+	//	and the locals the skipped branch would otherwise have set
+	//	(rename_list, pq_meta_preexisting_vars - both left empty/undefined
+	//	here), are still exactly what the shared apply block at the end of
+	//	this program expects.
+	if ("`metadata_only'" != "") {
+		if (`b_append') {
+			display as error "metadata_only may not be combined with append"
+			exit 198
+		}
+		if ("`nostatametadata'" != "") {
+			display as error "metadata_only may not be combined with nostatametadata"
+			exit 198
+		}
+		if ("`source_format'" != "parquet") {
+			display as error "metadata_only is only supported for Parquet input"
+			exit 198
+		}
+		if (`=_N' == 0) {
+			display as error "No data in memory for metadata_only to apply to"
+			exit 2000
+		}
+		plugin call polars_parquet_plugin, describe_stata_metadata "`using'" 1
+	}
+	else {
+
+	//	Pre-flight: validate embedded Stata metadata (conflicting/mixed/
+	//	malformed footers across a directory or glob) BEFORE clearing the
+	//	currently loaded dataset. Without this, a bad target directory
+	//	would wipe the caller's existing data via `clear' below and only
+	//	then fail deep inside the "read" plugin call, losing data neither
+	//	the old nor the new dataset. Not run for metadata_only (handled in
+	//	its own branch above, before any clear) or when the caller opted
+	//	out entirely with nostatametadata.
+	if ("`nostatametadata'" == "" & "`source_format'" == "parquet") {
+		plugin call polars_parquet_plugin, describe_stata_metadata "`using'" 1
+	}
+
 	if (!`b_append' & "`clear'" != "")	clear
 	if (`=_N' > 0 & !`b_append') {
 		display as error "There is already data loaded, pass clear if you want to load a file"
@@ -510,8 +575,9 @@ program pq_use_append
 	// matched_vars. drop_strl columns (binary parquet type) are filtered below.
 	local b_binary_to_string = ("`binary_to_string'" != "")
 	local b_cast_strict = ("`lax'" == "")
+	local b_safe_int64 = ("`safe_int64'" != "")
 	local pq_cast_buf `cast'
-	plugin call polars_parquet_plugin, describe "`using'" `b_quiet' `b_detailed' `"`sql_if'"' "`asterisk_to_variable'" `b_compress' `b_compress_string_to_numeric' "`source_format'" `infer_schema_length_for_plugin' `parse_dates_for_plugin' `b_fast' 100 "pq_namelist_buf" "`drop'" "pq_cast_buf" `b_binary_to_string' `b_cast_strict'
+	plugin call polars_parquet_plugin, describe "`using'" `b_quiet' `b_detailed' `"`sql_if'"' "`asterisk_to_variable'" `b_compress' `b_compress_string_to_numeric' "`source_format'" `infer_schema_length_for_plugin' `parse_dates_for_plugin' `b_fast' 100 "pq_namelist_buf" "`drop'" "pq_cast_buf" `b_binary_to_string' `b_cast_strict' `b_safe_int64'
 	if (_rc) {
 		if (`"`pq_cast_error'"' != "") di as error "`pq_cast_error'"
 		exit _rc
@@ -646,7 +712,55 @@ program pq_use_append
 	local all_strl_append = (`b_append' & `n_matched_total' > 0 & `n_matched_total' == `n_strl_matched')
 
 	local n_obs_after = `n_obs_already' + `row_to_read'
+
+	//	Declare every NEW variable via Mata (st_addvar) before `set obs'
+	//	extends the dataset, instead of one `gen' per variable afterward -
+	//	each `gen' would redundantly refill all N rows again. Pre-existing
+	//	variables (append/recast) still go through the loop below unchanged.
 	if (!`all_strl_append') {
+		local pq_batch_new_names
+		local pq_batch_new_types
+		foreach vari in `matched_vars' {
+			local var_number: list posof "`vari'" in vars_in_file
+			local type `type_`var_number''
+			local string_length `string_length_`var_number''
+
+			local name_to_create `vari'
+			forvalues i = 1/`n_renamed' {
+				local rename_from `rename_from_`i''
+				if ("`vari'" == "`rename_from'") {
+					local name_to_create `rename_to_`i''
+					continue, break
+				}
+			}
+
+			local is_strl_col : list posof "`vari'" in strl_col_names
+			if ("`type'" == "strl" | `is_strl_col' > 0 | "`type'" == "binary") {
+				continue
+			}
+
+			capture confirm variable `name_to_create', exact
+			if (_rc == 0) continue
+
+			local mata_type `type'
+			if ("`mata_type'" == "datetime" | "`mata_type'" == "time") {
+				local mata_type double
+			}
+			else if ("`mata_type'" == "date") {
+				local mata_type long
+			}
+			else if ("`mata_type'" == "string") {
+				local mata_str_len = max(1,`string_length')
+				local mata_type str`mata_str_len'
+			}
+
+			local pq_batch_new_names `pq_batch_new_names' `name_to_create'
+			local pq_batch_new_types `pq_batch_new_types' `mata_type'
+		}
+		if ("`pq_batch_new_names'" != "") {
+			mata: _pq_batch_addvar("`pq_batch_new_names'", "`pq_batch_new_types'")
+		}
+
 		quietly set obs `n_obs_after'
 	}
 
@@ -662,19 +776,6 @@ program pq_use_append
 		local var_number: list posof "`vari'" in vars_in_file
 		local type `type_`var_number''
 		local string_length `string_length_`var_number''
-
-		//	If pq save embedded original Stata storage metadata, prefer it over
-		//	the inferred Parquet storage type where safe.
-		if ("`source_format'" == "parquet" & "`stata_metadata_present'" == "1") {
-			local declared_type `"`stata_declared_type_`var_number''"'
-			if inlist("`declared_type'", "byte", "int", "long", "float", "double") {
-				local type `declared_type'
-			}
-			else if regexm("`declared_type'", "^str([0-9]+)$") {
-				local type string
-				local string_length = max(`string_length', real(regexs(1)))
-			}
-		}
 
 		//	Set rename_to to nothing
 		local rename_to
@@ -704,8 +805,11 @@ program pq_use_append
 				local rename_list `rename_list' `name_to_create'
 				local rename_count = `rename_count' + 1
 				local rename_from_`rename_count' `vari'
-				capture char `name_to_create'[pq_parquet_name] `"`vari'"'
-
+				//	Rename bookkeeping lives in a characteristic, not the
+				//	variable label, so statametadata's real label can
+				//	coexist with a later `pq save' round-tripping this
+				//	(possibly >32 char / invalid) original Parquet name.
+				char `name_to_create'[_pq_parquet_name] `"`vari'"'
 			}
 			//	Don't add strL to match_vars_non_binary - they're not sent to read plugin
 			continue
@@ -736,9 +840,11 @@ program pq_use_append
 			local rename_count = `rename_count' + 1
 			local rename_from_`rename_count' `vari'
 
-							capture char `name_to_create'[pq_parquet_name] `"`vari'"'
-
-
+			//	Rename bookkeeping lives in a characteristic, not the
+			//	variable label, so statametadata's real label can
+			//	coexist with a later `pq save' round-tripping this
+			//	(possibly >32 char / invalid) original Parquet name.
+			char `name_to_create'[_pq_parquet_name] `"`vari'"'
 		}
 
 		if (`keep') {
@@ -768,11 +874,14 @@ program pq_use_append
 
 		if (`i_matched' > 0) {
 			local v_to_read_index_`i_matched' `i'
-			local v_to_read_name_`i_matched' `vari'
+			//	Name used to look up the column in the Polars batch, which always
+			//	keeps the original (possibly >32 char) parquet column name - not
+			//	the (possibly truncated/renamed) Stata variable name `vari'.
+			local v_to_read_name_`i_matched' `vari_original'
 			local v_to_read_type_`i_matched': type `vari'
 			local v_to_read_type_`i_matched' = lower("`v_to_read_type_`i_matched''")
 			//	For getting the polars and polars assigned stata type and passing back to read
-			local i_original : list posof "`vari'" in vars_in_file
+			local i_original : list posof "`vari_original'" in vars_in_file
 
 
 			//	Get the originally set stata type
@@ -793,7 +902,8 @@ program pq_use_append
 
 	//	strl col names and dta path are passed so the plugin writes the strl .dta
 	//	in the same scan as the non-strl columns (consistent sampling)
-	capture noisily plugin call polars_parquet_plugin, read "`using'" "from_macro" `row_to_read' `offset' `"`sql_if'"' `"`mapping'"' `vertical_relaxed' "`asterisk_to_variable'" "`sort'" `n_obs_already' `random_share' `random_seed' `batch_size_for_plugin' "`strl_col_names'" "`temp_strl_dta'" "`source_format'" `b_preserve_order' `infer_schema_length_for_plugin' `parse_dates_for_plugin'
+	local b_skip_metadata = ("`nostatametadata'" != "")
+	capture noisily plugin call polars_parquet_plugin, read "`using'" "from_macro" `row_to_read' `offset' `"`sql_if'"' `"`mapping'"' `vertical_relaxed' "`asterisk_to_variable'" "`sort'" `n_obs_already' `random_share' `random_seed' `batch_size_for_plugin' "`strl_col_names'" "`temp_strl_dta'" "`source_format'" `b_preserve_order' `infer_schema_length_for_plugin' `parse_dates_for_plugin' "" `b_skip_metadata'
 	local _read_rc = _rc
 	if (`_read_rc') {
 		if (`b_append' & !`all_strl_append' & `n_obs_already' < _N) {
@@ -857,77 +967,6 @@ program pq_use_append
 		capture order `ordered_vars'
 	}
 
-	//	Apply Stata metadata embedded in parquet key/value metadata.
-	//	Rust sets stata_label_#, stata_comment_#, and stata_format_# during describe.
-	if ("`source_format'" == "parquet" & "`stata_metadata_present'" == "1") {
-		foreach vari in `matched_vars' {
-			local var_number: list posof "`vari'" in vars_in_file
-			if (`var_number' <= 0) continue
-
-			local final_name `vari'
-			forvalues ri = 1/`rename_count' {
-				if ("`vari'" == "`rename_from_`ri''") {
-					local pos : list posof "`rename_from_`ri''" in rename_list
-					if (`pos' > 0) {
-						local final_name : word `pos' of `rename_list'
-					}
-					continue, break
-				}
-			}
-
-			capture confirm variable `final_name', exact
-			if (_rc) continue
-
-			local metadata_label `"`stata_label_`var_number''"'
-			if (`"`metadata_label'"' != "") {
-				capture label variable `final_name' `"`metadata_label'"'
-			}
-
-			local metadata_format `"`stata_format_`var_number''"'
-			if (`"`metadata_format'"' != "") {
-				capture format `final_name' `metadata_format'
-			}
-
-			local note_count = real("0`stata_note_count_`var_number''")
-			if (`note_count' > 0) {
-				capture notes drop `final_name'
-				forvalues ni = 1/`note_count' {
-					local metadata_note `"`stata_note_`var_number'_`ni''"'
-					//	`notes var: text' stores the rest of the line verbatim, so
-					//	the text must NOT be wrapped in (compound) quotes -- those
-					//	characters would be stored as part of the note.
-					if (`"`metadata_note'"' != "") {
-						capture notes `final_name': `metadata_note'
-					}
-				}
-			}
-			else {
-				local metadata_comment `"`stata_comment_`var_number''"'
-				if (`"`metadata_comment'"' != "") {
-					capture notes drop `final_name'
-					capture notes `final_name': `metadata_comment'
-				}
-			}
-
-			local metadata_value_label_name `"`stata_value_label_name_`var_number''"'
-			local value_label_count = real("0`stata_value_label_count_`var_number''")
-			if (`"`metadata_value_label_name'"' != "" & `value_label_count' > 0) {
-				capture confirm numeric variable `final_name'
-				if (!_rc) {
-					capture label drop `metadata_value_label_name'
-					forvalues vli = 1/`value_label_count' {
-						local vlvalue `"`stata_value_label_value_`var_number'_`vli''"'
-						local vltext `"`stata_value_label_text_`var_number'_`vli''"'
-						if (`"`vlvalue'"' != "" & `"`vltext'"' != "") {
-							capture label define `metadata_value_label_name' `vlvalue' `"`vltext'"', modify
-						}
-					}
-					capture label values `final_name' `metadata_value_label_name'
-				}
-			}
-		}
-	}
-
 	//	BATCH 2: Overflow rows via .dta append (if batching was needed)
 	if (`needs_batching') {
 		display as text "Batch 1 complete. Processing overflow batch..."
@@ -968,6 +1007,181 @@ program pq_use_append
 		capture erase "`temp_overflow_dta'"
 
 		display as text "Overflow batch complete. Total rows loaded: `=_N'"
+	}
+
+	}	//	end of the "not metadata_only" branch opened above
+
+	//	Apply Stata label/format metadata that the plugin staged as indexed
+	//	pq_meta_* macros while reading the footer (see stata_metadata.rs).
+	//	macval() is used at every point free-text metadata lands in a
+	//	command, since a plain `macroname' dereference re-scans the
+	//	substituted text for backtick/$ sequences and would corrupt labels
+	//	or notes that happen to contain them.
+	if ("`nostatametadata'" == "" & "`pq_meta_present'" == "1") {
+		local pq_meta_names_all
+		forvalues j = 1/`pq_meta_count' {
+			local pq_meta_names_all `pq_meta_names_all' `pq_meta_name_`j''
+		}
+
+		//	Value-label definitions are staged indexed by a small integer
+		//	`m' (see _pq_stage_vallabel_defn), not by name - build the
+		//	name -> m lookup once.
+		local pq_meta_vallabel_names_all
+		forvalues m = 1/`pq_meta_vallabel_count' {
+			local pq_meta_vallabel_names_all `pq_meta_vallabel_names_all' `pq_meta_vallabel_name_`m''
+		}
+
+		local pq_meta_vallabels_applied
+		foreach vari of varlist * {
+			//	On append, only newly created variables get metadata applied -
+			//	a variable that already existed keeps whatever label/value
+			//	label/notes the user already had on it.
+			local i_preexisting : list posof "`vari'" in pq_meta_preexisting_vars
+			if (`i_preexisting' > 0) continue
+
+			local i_rename : list posof "`vari'" in rename_list
+			if (`i_rename' > 0)		local vari_original `rename_from_`i_rename''
+			else					local vari_original `vari'
+
+			local j : list posof "`vari_original'" in pq_meta_names_all
+			if (`j' == 0) continue
+
+			//	Rename bookkeeping now lives in the _pq_parquet_name
+			//	characteristic, not the label (see pq_use_append and
+			//	pq_save), so the real label can always be restored here,
+			//	including for a variable that was auto-renamed for a long
+			//	or invalid Parquet name.
+			if (`"`macval(pq_meta_label_`j')'"' != "") {
+				label variable `vari' `"`macval(pq_meta_label_`j')'"'
+			}
+
+			local varformat `pq_meta_format_`j''
+			if ("`varformat'" != "") {
+				capture noisily format `vari' `varformat'
+			}
+
+			local vlname `pq_meta_vallabel_`j''
+			if ("`vlname'" != "") {
+				local already : list posof "`vlname'" in pq_meta_vallabels_applied
+				if (`already' == 0) {
+					local pq_meta_vallabels_applied `pq_meta_vallabels_applied' `vlname'
+					local m : list posof "`vlname'" in pq_meta_vallabel_names_all
+					if (`m' > 0) {
+						capture label drop `vlname'
+						local defn_count `pq_meta_vallabel_defn_count_`m''
+						forvalues k = 1/`defn_count' {
+							label define `vlname' `pq_meta_vallabel_defn_code_`m'_`k'' ///
+								`"`macval(pq_meta_vallabel_defn_text_`m'_`k')'"', add
+						}
+					}
+				}
+				label values `vari' `vlname'
+			}
+
+			local note_count `pq_meta_note_`j'_count'
+			if ("`note_count'" != "0" & "`note_count'" != "") {
+				quietly notes drop `vari'
+				forvalues k = 1/`note_count' {
+					notes `vari': `"`macval(pq_meta_note_`j'_`k')'"'
+				}
+			}
+		}
+
+		//	Dataset-level label/notes: left alone on append, matching the
+		//	existing dataset rather than overwriting it from one file.
+		if (!`b_append') {
+			label data `"`macval(pq_meta_dataset_label)'"'
+
+			local dnote_count `pq_meta_dataset_note_count'
+			if ("`dnote_count'" != "0" & "`dnote_count'" != "") {
+				quietly notes drop _dta
+				forvalues k = 1/`dnote_count' {
+					notes: `"`macval(pq_meta_dataset_note_`k')'"'
+				}
+			}
+		}
+	}
+end
+
+//	Declares every variable in `names_sp' with the parallel type in
+//	`types_sp' via st_addvar - one Mata call instead of one `gen' per
+//	variable. The caller still owns the single `set obs' that follows.
+capture mata: mata drop _pq_batch_addvar()
+mata:
+void _pq_batch_addvar(string scalar names_sp, string scalar types_sp)
+{
+	string rowvector names, types
+	real scalar i
+
+	names = tokens(names_sp)
+	types = tokens(types_sp)
+	for (i = 1; i <= cols(names); i++) {
+		(void) st_addvar(types[i], names[i])
+	}
+}
+end
+
+//	Widens a numeric variable's storage type via a Mata view-copy instead of
+//	`recast' - ~3x faster at scale, same reasoning as the `gen' fix above.
+capture mata: mata drop _pq_widen_numeric()
+mata:
+void _pq_widen_numeric(string scalar oldname, string scalar newtype, string scalar newname)
+{
+	real colvector vold
+	real colvector vnew
+
+	st_view(vold, ., oldname)
+	(void) st_addvar(newtype, newname)
+	st_view(vnew, ., newname)
+	vnew[.,.] = vold
+}
+end
+
+//	Unlike `recast' (in-place), this creates a new variable and swaps it
+//	into `name', so nothing about the old one carries over automatically.
+//	Format, variable label, value label, column position, and every
+//	characteristic (notes included - they're just characteristics under
+//	the hood) are captured before the swap and reapplied after.
+capture program drop pq_fast_recast
+program pq_fast_recast
+	version 16
+	syntax, name(string) newtype(string)
+
+	local orig_fmt: format `name'
+	local orig_varlabel: variable label `name'
+	local orig_vallabel: value label `name'
+
+	//	Values must be read from the OLD variable before it is dropped -
+	//	`: char name[]' only gives the key names.
+	local orig_char_names : char `name'[]
+	local n_chars : word count `orig_char_names'
+	forvalues c = 1/`n_chars' {
+		local cnm_`c' : word `c' of `orig_char_names'
+		local cval_`c' : char `name'[`cnm_`c'']
+	}
+
+	//	`order' only touches the variable table, not row data, so restoring
+	//	it here isn't the O(N) cost this routine exists to avoid.
+	unab pq_fr_all_vars : _all
+
+	tempvar newv
+	mata: _pq_widen_numeric("`name'", "`newtype'", "`newv'")
+
+	quietly drop `name'
+	quietly rename `newv' `name'
+	quietly order `pq_fr_all_vars'
+
+	if ("`orig_fmt'" != "") {
+		capture format `name' `orig_fmt'
+	}
+	if (`"`orig_varlabel'"' != "") {
+		label variable `name' `"`macval(orig_varlabel)'"'
+	}
+	if ("`orig_vallabel'" != "") {
+		label values `name' `orig_vallabel'
+	}
+	forvalues c = 1/`n_chars' {
+		char `name'[`cnm_`c''] `"`macval(cval_`c')'"'
 	}
 end
 
@@ -1035,10 +1249,10 @@ program pq_gen_or_recast
 		}
 		else {
 			if inlist("`vartype'", "long","double") {
-				recast double `name'
+				pq_fast_recast, name(`name') newtype(double)
 			}
 			else if inlist("`vartype'", "byte", "int") {
-				recast float `name'
+				pq_fast_recast, name(`name') newtype(float)
 			}
 		}
 	}
@@ -1048,10 +1262,10 @@ program pq_gen_or_recast
 		}
 		else {
 			if inlist("`vartype'", "byte", "int") {
-				recast long `name'
+				pq_fast_recast, name(`name') newtype(long)
 			}
 			else if inlist("`vartype'", "float") {
-				recast double `name'
+				pq_fast_recast, name(`name') newtype(double)
 			}
 		}
 	}
@@ -1061,7 +1275,7 @@ program pq_gen_or_recast
 		}
 		else {
 			if inlist("`vartype'", "byte") {
-				recast int `name'
+				pq_fast_recast, name(`name') newtype(int)
 			}
 		}
 	}
@@ -1070,6 +1284,8 @@ program pq_gen_or_recast
 			quietly gen byte `name' = .
 		}
 		else {
+			//	Same source and target type by construction - a genuine
+			//	no-op left on the native path (nothing for Mata to win).
 			if inlist("`vartype'", "int","long","float","double") {
 				recast `vartype' `name'
 			}
@@ -1084,7 +1300,7 @@ program pq_gen_or_recast
 		}
 		else {
 			if inlist("`vartype'", "byte", "int", "long", "float") {
-				recast double `name'
+				pq_fast_recast, name(`name') newtype(double)
 			}
 		}
 	}
@@ -1170,6 +1386,81 @@ program pq_describe, rclass
 end
 
 
+capture program drop pq_metadata
+program pq_metadata, rclass
+	version 16.0
+
+	local input_args = `"`0'"'
+
+	local using_pos = strpos(`" `input_args' "', " using ")
+	if `using_pos' > 0 {
+		local pre_using = substr(`"`input_args'"', 1, `using_pos'-1)
+		if `"`pre_using'"' != "" {
+			di as error "varlist not allowed"
+			error 101
+		}
+		local rest = substr(`"`input_args'"', `using_pos'+6, .)
+		local 0 = `"using `rest'"'
+	}
+	else {
+		local 0 = `"using `input_args'"'
+	}
+
+	syntax using/ [, quietly]
+
+	pq_register_plugin
+	local b_quiet = ("`quietly'" != "")
+
+	pq_convert_path `"`using'"'
+	local using = r(fullpath)
+	pq_infer_format, path("`using'")
+	local source_format = r(format)
+	if ("`source_format'" != "parquet") {
+		display as error "pq metadata is only supported for Parquet input"
+		exit 198
+	}
+
+	plugin call polars_parquet_plugin, describe_stata_metadata "`using'" `b_quiet'
+
+	return local pq_meta_present `"`pq_meta_present'"'
+	if ("`pq_meta_present'" == "1") {
+		return local pq_meta_count `"`pq_meta_count'"'
+		return local pq_meta_dataset_label `"`macval(pq_meta_dataset_label)'"'
+	}
+end
+
+
+//	st_vlload returns exactly the defined (code, text) pairs for a value
+//	label, unlike scanning min()/max() in ado, which breaks on sparse or
+//	negative codes. st_local() writes straight into the calling program's
+//	locals, so no macro re-expansion risk for label text containing
+//	backticks or $.
+//
+//	Staged macros are indexed by the integer `m', not by the value-label
+//	name itself: Stata macro *names* are capped at 32 characters (same as
+//	variable names), and a name-keyed macro name like
+//	pq_meta_vallabel_defn_count_<name> can exceed that for an ordinary
+//	label name. pq_meta_vallabel_name_`m' records the name separately.
+capture mata: mata drop _pq_stage_vallabel_defn()
+mata:
+void _pq_stage_vallabel_defn(string scalar vlname, real scalar m)
+{
+	real colvector values
+	string colvector texts
+	real scalar i
+	string scalar prefix
+
+	prefix = strofreal(m)
+	st_local("pq_meta_vallabel_name_" + prefix, vlname)
+
+	st_vlload(vlname, values, texts)
+	st_local("pq_meta_vallabel_defn_count_" + prefix, strofreal(rows(values)))
+	for (i = 1; i <= rows(values); i++) {
+		st_local("pq_meta_vallabel_defn_code_" + prefix + "_" + strofreal(i), strofreal(values[i]))
+		st_local("pq_meta_vallabel_defn_text_" + prefix + "_" + strofreal(i), texts[i])
+	}
+}
+end
 
 
 capture program drop pq_save
@@ -1211,9 +1502,15 @@ program pq_save
 						   stream							///
 						   CONSolidate						///
 						   DO_not_reload					///
-						   label 							///	
+						   label 							///
 						   format(string)					///
-						   ]	//	in(string) 
+						   statametadata					///
+						   ]	//	in(string)
+
+	if ("`label'" != "" & "`statametadata'" != "") {
+		display as error "label and statametadata may not be combined"
+		exit 198
+	}
         
 	//	if "`partition_by'" != "" {
 	//		di as error "Hive partitioning not implemented yet"
@@ -1334,51 +1631,91 @@ program pq_save
 		local str_length_`var_count' `str_length'
 		local col_`var_count' : list posof "`vari'" in _all_variables_ordered
 		
-		local variable_label_`var_count' : variable label `vari'
-		local note_count_`var_count' 0
-		local note0_`var_count' : char `vari'[note0]
-		if (`"`note0_`var_count''"' != "") {
-			local note_count_`var_count' = real("`note0_`var_count''")
-			forvalues ni = 1/`note_count_`var_count'' {
-				local note_`var_count'_`ni' : char `vari'[note`ni']
-			}
-		}
-		local value_label_name_`var_count' : value label `vari'
-		local value_label_count_`var_count' 0
-		if (`"`value_label_name_`var_count''"' != "") {
-			capture confirm numeric variable `vari'
-			if (!_rc) {
-				//	Enumerate the FULL value-label definition (every mapping,
-				//	including values that do not appear in the data) so nothing is
-				//	lost on the round trip.  Sets value_label_count_# and the
-				//	value_label_value_#_# / value_label_text_#_# locals.
-				mata: pq_collect_value_labels(`var_count', "`value_label_name_`var_count''")
-			}
-		}
-
 		//	Rename?
 		if ("`noautorename'" == "") {
-			local parquet_namei : char `vari'[pq_parquet_name]
-			if (`"`parquet_namei'"' == "") {
-				//	Backward compatibility with older pq imports that stored the original
-				//	Parquet column name in the variable label.
-				local labeli: variable label `vari'
-				local labeli: subinstr local labeli "\`" "'", all
-				if regexm(`"`labeli'"', "^\{parquet_name:([^}]*)\}") {
-					local parquet_namei = regexs(1)
-				}
-			}
+			//	Two independent ways to request a rename on save, checked
+			//	in this order:
+			//	1. The _pq_parquet_name characteristic, set automatically
+			//	   by pq_use_append when it had to shorten/sanitize a long
+			//	   or invalid Parquet name - kept off the label so
+			//	   statametadata's real label can coexist with it.
+			//	2. The legacy "{parquet_name:original}" variable-label
+			//	   convention - a documented escape hatch a user can set
+			//	   by hand (see rename.do) to force ANY variable to save
+			//	   back out under a different Parquet column name. Still
+			//	   honored for backward compatibility; a variable using
+			//	   this form has no real label to preserve regardless.
+			local parquet_name_char : char `vari'[_pq_parquet_name]
 
-			if (`"`parquet_namei'"' != "") {
+			if (`"`parquet_name_char'"' != "") {
 				local n_rename = `n_rename' + 1
 				local rename_from_`n_rename' `vari'
-				local rename_to_`n_rename' `"`parquet_namei'"'
+				local rename_to_`n_rename' `"`parquet_name_char'"'
+			}
+			else {
+				local labeli: variable label `vari'
+				local labeli: subinstr local labeli "\`" "'", all
+
+				if regexm(`"`labeli'"', "^\{parquet_name:([^}]*)\}") {
+					local n_rename = `n_rename' + 1
+					local rename_from_`n_rename' `vari'
+					local rename_to_`n_rename' = regexs(1)
+				}
+
+				//	di "n_rename: `n_rename'"
+				//	di "	from: `rename_from_`n_rename''"
+				//	di "	to:   `rename_to_`n_rename''"
 			}
 		}
 	}
-	
-	
-	
+
+	//	Stage Stata label/format metadata as indexed macros for the plugin
+	//	to read directly (mirrors name_N/dtype_N above) - every saved
+	//	variable is staged unconditionally so display-format-only or
+	//	unlabelled columns still carry their (empty) entry; the Rust side
+	//	skips a variable whose label/value-label/notes are all empty.
+	local pq_meta_count = 0
+	if ("`statametadata'" != "") {
+		local pq_meta_count `var_count'
+		local pq_meta_vallabels_built
+		local pq_meta_vallabel_count = 0
+		local j = 0
+		foreach vari in `varlist' {
+			local j = `j' + 1
+
+			local pq_meta_name_`j' `vari'
+			local pq_meta_label_`j' : variable label `vari'
+			local pq_meta_vallabel_`j' : value label `vari'
+			local pq_meta_format_`j' : format `vari'
+
+			local note_count : char `vari'[note0]
+			if ("`note_count'" == "") local note_count 0
+			local pq_meta_note_`j'_count `note_count'
+			forvalues k = 1/`note_count' {
+				local pq_meta_note_`j'_`k' : char `vari'[note`k']
+			}
+
+			local vlname `pq_meta_vallabel_`j''
+			if ("`vlname'" != "") {
+				local already_built : list posof "`vlname'" in pq_meta_vallabels_built
+				if (`already_built' == 0) {
+					local pq_meta_vallabels_built `pq_meta_vallabels_built' `vlname'
+					local pq_meta_vallabel_count = `pq_meta_vallabel_count' + 1
+					mata: _pq_stage_vallabel_defn("`vlname'", `pq_meta_vallabel_count')
+				}
+			}
+		}
+
+		local pq_meta_dataset_label : data label
+		local pq_meta_dataset_note_count : char _dta[note0]
+		if ("`pq_meta_dataset_note_count'" == "") local pq_meta_dataset_note_count 0
+		forvalues k = 1/`pq_meta_dataset_note_count' {
+			local pq_meta_dataset_note_`k' : char _dta[note`k']
+		}
+	}
+
+
+
 	if ("`in'" != "") {
 		local offset = substr("`in'", 1, strpos("`in'", "/") -1)
 		local offset = max(`offset',0)
@@ -1634,6 +1971,33 @@ program pq_register_plugin
 end
 
 
+//	Sets the number of threads polars (and pq's own parallel read path) uses,
+//	via the POLARS_MAX_THREADS environment variable. Polars builds its global
+//	thread pool lazily the first time it is actually used, and only reads that
+//	variable once - so this only works before any other pq command (use,
+//	describe, save, merge, metadata, ...) has run in the current Stata session.
+//	Once that has happened, the plugin refuses and explains why.
+capture program drop pq_set_threads
+program pq_set_threads
+	version 16.0
+	syntax anything
+
+	local n_threads `anything'
+	capture confirm integer number `n_threads'
+	if (_rc) {
+		display as error `"pq set_threads requires a positive integer, passed "`n_threads'""'
+		exit 198
+	}
+	if (`n_threads' < 1) {
+		display as error `"pq set_threads requires a positive integer, passed "`n_threads'""'
+		exit 198
+	}
+
+	pq_register_plugin
+	plugin call polars_parquet_plugin, set_threads "`n_threads'"
+end
+
+
 
 
 program define pq_infer_format, rclass
@@ -1795,32 +2159,4 @@ program define pq_convert_path, rclass
     
     // Return the full path
     return local fullpath "`fullpath'"
-end
-
-
-//	--------------------------------------------------------------------------
-//	Mata helper: dump the full contents of a value label into the locals that
-//	pq_save sends to the plugin (value_label_count_#, value_label_value_#_#,
-//	value_label_text_#_#).  Enumerates every defined mapping, not just the
-//	values present in the data.
-//	--------------------------------------------------------------------------
-version 16.0
-mata:
-void pq_collect_value_labels(real scalar vc, string scalar lname)
-{
-	real colvector   vals
-	string colvector txts
-	real scalar      i, n
-
-	if (lname == "" | st_vlexists(lname) == 0) return
-	st_vlload(lname, vals, txts)
-	n = rows(vals)
-	st_local("value_label_count_" + strofreal(vc), strofreal(n))
-	for (i = 1; i <= n; i++) {
-		st_local("value_label_value_" + strofreal(vc) + "_" + strofreal(i),
-		         strofreal(vals[i], "%18.0g"))
-		st_local("value_label_text_" + strofreal(vc) + "_" + strofreal(i),
-		         txts[i])
-	}
-}
 end
