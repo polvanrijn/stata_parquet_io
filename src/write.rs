@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
 use std::fs::File;
-use polars::prelude::{KeyValueMetadata, NamedFrom, TimeUnit};
+use polars::prelude::{NamedFrom, TimeUnit};
 use polars::prelude::*;
 use polars_sql::SQLContext;
 use rayon::prelude::*;
@@ -10,15 +10,14 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::path::Path;
 use polars_parquet::write::{BrotliLevel, GzipLevel, ZstdLevel};
-use polars_parquet::arrow::write::schema_to_metadata_key;
 
-use crate::{downcast, stata_interface};
+use crate::{downcast, stata_interface, stata_metadata};
 use crate::stata_interface::{
     display,
     get_macro
 };
-use crate::mapping::{self, StataColumnInfo, StataValueLabel};
-use crate::parquet_metadata::stata_variable_metadata_json;
+use crate::mapping::{self, StataColumnInfo};
+use polars::prelude::KeyValueMetadata;
 
 use crate::utilities::{
     DAY_SHIFT_SAS_STATA,
@@ -113,14 +112,16 @@ pub fn write_from_stata(
         //  display(&format!("from n = {}",n_vars));
         column_info_from_macros(
             n_vars,
-            rename_list
+            rename_list.clone()
         )
     } else {
         serde_json::from_str(mapping).unwrap()
     };
     //    println!("columns     = {:?}", all_columns);
     //    println!("column info = {:?}", column_info);
-    let parquet_metadata_json = stata_variable_metadata_json(&column_info);
+
+    let key_value_metadata = stata_metadata::metadata_from_macros(&rename_list, &column_info)
+        .and_then(|envelope| stata_metadata::build_key_value_metadata(&envelope));
 
     // Convert Option<&str> to Option<String>
     let sql_if_owned = sql_if.map(|s| s.to_string());
@@ -167,18 +168,18 @@ pub fn write_from_stata(
                 compress_string,
                 quietly,
                 append_to_partition,
-                parquet_metadata_json.as_deref()
+                key_value_metadata,
             )
         } else {
             save_no_partition(
-                path, 
-                lf_unwrapped, 
+                path,
+                lf_unwrapped,
                 compression,
                 compression_level,
                 compress,
                 compress_string,
                 quietly,
-                parquet_metadata_json.as_deref()
+                key_value_metadata,
             )
         }
     } else {
@@ -280,7 +281,7 @@ fn save_partitioned(
     compress_string: bool,
     quietly: bool,
     append_to_partition: bool,
-    metadata_json: Option<&str>,
+    key_value_metadata: Option<KeyValueMetadata>,
 )  -> Result<i32,Box<dyn Error>> {
     let mut df = match lf.collect() {
         Err(e) => {
@@ -326,7 +327,7 @@ fn save_partitioned(
         false,
         quietly,
         append_to_partition,
-        metadata_json,
+        key_value_metadata,
     )
 
     // let partition_variant = PartitionVariant::ByKey {
@@ -404,10 +405,10 @@ fn save_partitioned_sequential(
     compress_string: bool,
     quietly: bool,
     append_to_partition: bool,
-    metadata_json: Option<&str>,
+    key_value_metadata: Option<KeyValueMetadata>,
 ) -> Result<i32, Box<dyn Error>> {
-    let mut pqo = parquet_options(compression, compression_level);
-
+    let pqo = parquet_options(compression, compression_level, key_value_metadata);
+    
     // First, get unique partition values by collecting only the partition columns
     let partition_values_df = lf.clone()
         .select(partition_by.iter().map(|col_name| col(col_name.clone())).collect::<Vec<_>>())
@@ -546,12 +547,11 @@ fn save_partitioned_sequential(
         // Generate a unique filename for this partition
         let file_idx = if append_to_partition { next_partition_file_index(&partition_dir) } else { 0 };
         let partition_file = partition_dir.join(format!("data_{}.parquet", file_idx));
-        set_stata_metadata(&mut pqo, partition_df.schema(), metadata_json);
         let file = File::create(&partition_file).map_err(|e| {
             display(&format!("Partition file create error for {}: {}", partition_dir.display(), e));
             e
         })?;
-        pqo.to_writer(file).finish(&mut partition_df).map_err(|e| {
+        write_parquet_file(&pqo, file, &mut partition_df).map_err(|e| {
             display(&format!("Partition write error for {}: {}", partition_dir.display(), e));
             e
         })?;
@@ -630,10 +630,14 @@ pub fn consolidate_parquet_dir(path: &str) -> Result<i32, Box<dyn Error>> {
     // Write to a temp file next to the directory, then swap
     let temp_path = format!("{}_consolidating.parquet", path);
 
-    // Preserve any embedded Stata variable metadata that the partition files carry.
-    let metadata_json =
-        crate::parquet_metadata::read_stata_variable_metadata_raw(path);
-    let mut pqo = parquet_options("zstd", None);
+    // Carry the source files' Stata metadata (if any) into the consolidated
+    // file - the files are expected to agree, so the first one found is
+    // representative.
+    let key_value_metadata = stata_metadata::first_parquet_file(path)
+        .and_then(|p| stata_metadata::read_metadata_from_parquet(&p))
+        .and_then(|envelope| stata_metadata::build_key_value_metadata(&envelope));
+
+    let pqo = parquet_options("zstd", None, key_value_metadata);
     let mut df = match lf.collect() {
         Ok(df) => df,
         Err(e) => {
@@ -641,10 +645,9 @@ pub fn consolidate_parquet_dir(path: &str) -> Result<i32, Box<dyn Error>> {
             return Ok(198);
         }
     };
-    set_stata_metadata(&mut pqo, df.schema(), metadata_json.as_deref());
 
     let file = File::create(&temp_path)?;
-    if let Err(e) = pqo.to_writer(file).finish(&mut df) {
+    if let Err(e) = write_parquet_file(&pqo, file, &mut df) {
         let _ = std::fs::remove_file(&temp_path);
         display(&format!("Error writing consolidated parquet: {}", e));
         return Ok(198);
@@ -703,7 +706,7 @@ fn save_no_partition(
     compress:bool,
     compress_string: bool,
     quietly: bool,
-    metadata_json: Option<&str>,
+    key_value_metadata: Option<KeyValueMetadata>,
 ) -> Result<i32,Box<dyn Error>> {
 
     if compress | compress_string {
@@ -735,14 +738,13 @@ fn save_no_partition(
     }
 
 
-    let mut pqo = parquet_options(compression, compression_level);
+    let pqo = parquet_options(compression, compression_level, key_value_metadata);
     match lf.collect() {
         Err(e) => {
             display(&format!("Parquet collect error: {}", e));
             Ok(198)
         },
         Ok(mut df) => {
-            set_stata_metadata(&mut pqo, df.schema(), metadata_json);
             let file = match File::create(path) {
                 Ok(f) => f,
                 Err(e) => {
@@ -750,7 +752,7 @@ fn save_no_partition(
                     return Ok(198);
                 }
             };
-            if let Err(e) = pqo.to_writer(file).finish(&mut df) {
+            if let Err(e) = write_parquet_file(&pqo, file, &mut df) {
                 display(&format!("Parquet write error: {}", e));
                 return Ok(198);
             }
@@ -763,11 +765,48 @@ fn save_no_partition(
     }
 }
 
+/// Write `df` to `file`, declaring strings as Arrow `large_string` (and
+/// binary as `large_binary`) in the embedded `ARROW:schema` rather than the
+/// `string_view` polars' eager writer uses by default. The parquet column
+/// data is identical either way (BYTE_ARRAY/UTF8) - only the schema hint
+/// differs - but R's arrow package cannot read `string_view` columns
+/// (apache/arrow#45523). Polars still reads these back as `String`.
+fn write_parquet_file(
+    pqo: &ParquetWriteOptions,
+    file: File,
+    df: &mut DataFrame,
+) -> PolarsResult<u64> {
+    let arrow_schema = polars::io::schema_to_arrow_checked(
+        df.schema(),
+        CompatLevel::oldest(),
+        "parquet",
+    )?;
+    let arrow_schema_kv = polars_parquet::write::schema_to_metadata_key(&arrow_schema);
+
+    let mut kv = match &pqo.key_value_metadata {
+        Some(meta) => meta.collect(ParquetMetadataContext {
+            arrow_schema: arrow_schema_kv.value.as_deref().unwrap_or_default(),
+        })?,
+        None => Vec::new(),
+    };
+    // BatchedWriter::finish only adds its own (string_view) schema when
+    // the metadata doesn't already carry one.
+    if !kv.iter().any(|item| item.key == arrow_schema_kv.key) {
+        kv.insert(0, arrow_schema_kv);
+    }
+
+    pqo.to_writer(file)
+        .with_key_value_metadata(Some(KeyValueMetadata::Static(kv)))
+        .finish(df)
+}
+
 fn parquet_options(
     compression:&str,
     compression_level:Option<usize>,
+    key_value_metadata: Option<KeyValueMetadata>,
 ) -> ParquetWriteOptions {
     let mut pqo = ParquetWriteOptions::default();
+    pqo.key_value_metadata = key_value_metadata;
     pqo.compression = match compression {
         "lz4" => ParquetCompression::Lz4Raw,
         "uncompressed" => ParquetCompression::Uncompressed,
@@ -800,55 +839,6 @@ fn parquet_options(
     };
 
     pqo
-}
-
-/// Key under which Stata variable metadata is embedded in the Parquet footer.
-const STATA_METADATA_KEY: &str = "stata.variable_metadata";
-
-/// Build the key/value metadata to embed in a Parquet file so that the Stata
-/// variable metadata survives *both* our own reader and external Arrow-based
-/// readers (pyarrow/pandas/polars).
-///
-/// The metadata is written in two places:
-///   1. As a plain file-level key/value pair (`stata.variable_metadata`), which
-///      is what `pq use` reads back.
-///   2. Embedded in the Arrow schema (the `ARROW:schema` IPC blob), because
-///      pyarrow's `read_schema().metadata` and pandas surface *that* metadata,
-///      not arbitrary file-level pairs. Polars would otherwise regenerate the
-///      `ARROW:schema` key from the (metadata-less) frame schema and drop ours;
-///      pre-supplying an `ARROW:schema` entry makes polars keep ours instead.
-fn stata_key_value_metadata(schema: &Schema, json: &str) -> KeyValueMetadata {
-    // Reconstruct the Arrow schema polars would write, then attach the Stata
-    // metadata at the schema level so it lands inside the ARROW:schema blob.
-    let mut arrow_schema: ArrowSchema = schema
-        .iter()
-        .map(|(name, dtype)| {
-            let field = dtype.to_arrow_field(name.clone(), CompatLevel::newest());
-            (field.name.clone(), field)
-        })
-        .collect();
-    arrow_schema
-        .metadata_mut()
-        .insert(STATA_METADATA_KEY.into(), json.into());
-
-    let mut entries: Vec<(String, String)> = Vec::with_capacity(2);
-    let arrow_kv = schema_to_metadata_key(&arrow_schema);
-    if let Some(value) = arrow_kv.value {
-        entries.push((arrow_kv.key, value));
-    }
-    entries.push((STATA_METADATA_KEY.to_string(), json.to_string()));
-    KeyValueMetadata::from_static(entries)
-}
-
-/// Set the embedded Stata metadata on `pqo` for the given frame `schema`.
-fn set_stata_metadata(
-    pqo: &mut ParquetWriteOptions,
-    schema: &Schema,
-    metadata_json: Option<&str>,
-) {
-    if let Some(json) = metadata_json {
-        pqo.key_value_metadata = Some(stata_key_value_metadata(schema, json));
-    }
 }
 
 fn get_rename_list() -> HashMap<PlSmallStr,PlSmallStr> {
@@ -914,40 +904,12 @@ fn column_info_from_macros(
         let stata_col_str = get_macro(&format!("col_{}", i+1), false, None);
         let stata_col = stata_col_str.parse::<usize>().unwrap_or(0);
 
-        let variable_label = get_macro(&format!("variable_label_{}", i+1), false, Some(1024 * 1024));
-        let note_count = get_macro(&format!("note_count_{}", i+1), false, None)
-            .parse::<usize>()
-            .unwrap_or(0);
-        let notes = (1..=note_count)
-            .map(|j| get_macro(&format!("note_{}_{}", i+1, j), false, Some(1024 * 1024)))
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>();
-        let value_label_name = get_macro(&format!("value_label_name_{}", i+1), false, None);
-        let value_label_count = get_macro(&format!("value_label_count_{}", i+1), false, None)
-            .parse::<usize>()
-            .unwrap_or(0);
-        let value_labels = (1..=value_label_count)
-            .filter_map(|j| {
-                let value = get_macro(&format!("value_label_value_{}_{}", i+1, j), false, None);
-                let label = get_macro(&format!("value_label_text_{}_{}", i+1, j), false, Some(1024 * 1024));
-                if label.is_empty() {
-                    None
-                } else {
-                    Some(StataValueLabel { value, label })
-                }
-            })
-            .collect::<Vec<_>>();
-
         column_infos.push(StataColumnInfo {
             name,
             dtype,
             format,
             str_length,
             stata_col,
-            variable_label,
-            notes,
-            value_label_name,
-            value_labels,
         });
     }
     

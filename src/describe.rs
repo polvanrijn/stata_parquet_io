@@ -7,13 +7,14 @@ use std::time::{Duration, Instant};
 use glob::glob;
 
 use crate::fast_cache::{self, FastCacheKey, resolve_varlist};
-use crate::mapping::{is_string_type, schema_with_stata_types};
-use crate::parquet_metadata::read_stata_variable_metadata;
+use crate::mapping::{is_string_type, schema_with_stata_types, widen_with_recorded_type, StataType};
 use crate::stata_interface::{
     ST_retcode,
     display,
     set_macro,
 };
+use crate::stata_metadata::read_metadata_validated;
+use crate::parquet_stats::integer_ranges_for_path;
 use crate::utilities::{ms, normalize_path_separators, profile_timing_enabled};
 
 use crate::read::{
@@ -25,7 +26,9 @@ use crate::read::{
 
 use crate::downcast::{
     apply_user_cast,
+    find_optimal_integer_type,
     intelligent_downcast,
+    polars_type_to_stata_type,
     validate_user_type,
     DowncastConfig,
 };
@@ -49,6 +52,7 @@ pub fn file_summary(
     user_cast_json: &str,
     binary_to_string: bool,
     cast_strict: bool,
+    safe_int64: bool,
 ) -> i32 {
     let prof = profile_timing_enabled();
     let t_total = Instant::now();
@@ -118,76 +122,138 @@ pub fn file_summary(
 
     // Apply user cast (binary_to_string + cast option) BEFORE compress and schema computation
     // so that string lengths, types, and the fast cache all reflect the cast types.
-    if binary_to_string || !user_cast_json.is_empty() {
-        let scan_schema = match df.collect_schema() {
-            Ok(s) => s,
+    // Schema is needed regardless of these options to check for Int64/UInt64 precision
+    // overflow below, so it's always computed here.
+    let scan_schema = match df.collect_schema() {
+        Ok(s) => s,
+        Err(e) => {
+            display(&format!("Error reading schema for cast: {:?}", e));
+            return 198;
+        }
+    };
+
+    let mut cast_map: HashMap<String, String> = HashMap::new();
+
+    if binary_to_string {
+        for (name, dtype) in scan_schema.iter() {
+            if matches!(dtype, DataType::Binary) {
+                cast_map.insert(name.to_string(), "string".to_string());
+            }
+        }
+    }
+
+    if !user_cast_json.is_empty() {
+        let col_to_type: HashMap<String, Value> = match serde_json::from_str(user_cast_json) {
+            Ok(m) => m,
             Err(e) => {
-                display(&format!("Error reading schema for cast: {:?}", e));
+                let msg = format!("cast: invalid JSON: {}", e);
+                display(&msg);
+                set_macro("pq_cast_error", &msg, false);
                 return 198;
             }
         };
-
-        let mut cast_map: HashMap<String, String> = HashMap::new();
-
-        if binary_to_string {
-            for (name, dtype) in scan_schema.iter() {
-                if matches!(dtype, DataType::Binary) {
-                    cast_map.insert(name.to_string(), "string".to_string());
-                }
-            }
-        }
-
-        if !user_cast_json.is_empty() {
-            let col_to_type: HashMap<String, Value> = match serde_json::from_str(user_cast_json) {
-                Ok(m) => m,
-                Err(e) => {
-                    let msg = format!("cast: invalid JSON: {}", e);
+        for (col_name, type_val) in col_to_type {
+            let type_str = match type_val.as_str() {
+                Some(s) => s.to_lowercase(),
+                None => {
+                    let msg = format!("cast: type for '{}' must be a string", col_name);
                     display(&msg);
                     set_macro("pq_cast_error", &msg, false);
                     return 198;
                 }
             };
-            for (col_name, type_val) in col_to_type {
-                let type_str = match type_val.as_str() {
-                    Some(s) => s.to_lowercase(),
-                    None => {
-                        let msg = format!("cast: type for '{}' must be a string", col_name);
-                        display(&msg);
-                        set_macro("pq_cast_error", &msg, false);
-                        return 198;
+            if let Err(e) = validate_user_type(&type_str) {
+                let msg = format!("cast({}): {}", col_name, e);
+                display(&msg);
+                set_macro("pq_cast_error", &msg, false);
+                return 198;
+            }
+            if scan_schema.get(col_name.as_str()).is_none() {
+                let msg = format!("cast: column '{}' not found in file", col_name);
+                display(&msg);
+                set_macro("pq_cast_error", &msg, false);
+                return 198;
+            }
+            cast_map.insert(col_name, type_str);
+        }
+    }
+
+    // Stata has no native 64-bit integer type, so Int64/UInt64 columns are stored as
+    // doubles. Doubles only preserve integer precision up to +/-2^53, so values
+    // outside that range silently collide (distinct ids can become indistinguishable).
+    // Columns the user already cast explicitly above are left alone.
+    // Only columns that will actually be read: checking unrequested columns costs a
+    // full scan of them for nothing. Casts don't rename columns, so resolving against
+    // the scan schema matches the resolution done on the final schema below (which
+    // also reports any varlist error).
+    let scan_col_strs: Vec<&str> = scan_schema.iter_names().map(|s| s.as_str()).collect();
+    let requested_cols: Option<std::collections::HashSet<String>> =
+        resolve_varlist(columns_varlist, &scan_col_strs, drop_list)
+            .ok()
+            .map(|cols| cols.into_iter().collect());
+    let int64_candidates: Vec<PlSmallStr> = scan_schema
+        .iter()
+        .filter_map(|(name, dtype)| {
+            if matches!(dtype, DataType::Int64 | DataType::UInt64)
+                && !cast_map.contains_key(name.as_str())
+                && requested_cols.as_ref().map_or(true, |cols| cols.contains(name.as_str()))
+            {
+                Some(name.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if !int64_candidates.is_empty() {
+        match find_int64_precision_overflow_columns(&df, &int64_candidates) {
+            Ok(overflow_cols) if !overflow_cols.is_empty() => {
+                if safe_int64 {
+                    for name in &overflow_cols {
+                        cast_map.insert(name.to_string(), "string".to_string());
                     }
-                };
-                if let Err(e) = validate_user_type(&type_str) {
-                    let msg = format!("cast({}): {}", col_name, e);
+                } else {
+                    let col_list = overflow_cols
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let msg = format!(
+                        "Column(s) {} contain Int64/UInt64 values outside +/-2^53 \
+                         (9,007,199,254,740,992). Stata has no 64-bit integer type, so these \
+                         values would silently lose precision as a double (distinct values can \
+                         become indistinguishable). Use cast({{\"col\":\"string\"}}) to load the \
+                         affected column(s) as strings, or pass the safe_int64 option to do this \
+                         automatically.",
+                        col_list
+                    );
                     display(&msg);
                     set_macro("pq_cast_error", &msg, false);
                     return 198;
                 }
-                if scan_schema.get(col_name.as_str()).is_none() {
-                    let msg = format!("cast: column '{}' not found in file", col_name);
-                    display(&msg);
-                    set_macro("pq_cast_error", &msg, false);
-                    return 198;
-                }
-                cast_map.insert(col_name, type_str);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                display(&format!("Error checking Int64 precision range: {:?}", e));
+                return 198;
             }
         }
+    }
 
-        if !cast_map.is_empty() {
-            let combined_json = serde_json::to_string(&cast_map).unwrap_or_default();
-            df = match apply_user_cast(df, &combined_json, cast_strict) {
-                Ok(lf) => lf,
-                Err(e) => {
-                    let msg = format!("cast failed: {}", e);
-                    display(&msg);
-                    set_macro("pq_cast_error", &msg, false);
-                    return 198;
-                }
-            };
-            set_macro("pq_user_cast_json", &combined_json, false);
-            // Invalidate cached data that doesn't have this cast applied
-            fast_cache::clear();
-        }
+    if !cast_map.is_empty() {
+        let combined_json = serde_json::to_string(&cast_map).unwrap_or_default();
+        df = match apply_user_cast(df, &combined_json, cast_strict) {
+            Ok(lf) => lf,
+            Err(e) => {
+                let msg = format!("cast failed: {}", e);
+                display(&msg);
+                set_macro("pq_cast_error", &msg, false);
+                return 198;
+            }
+        };
+        set_macro("pq_user_cast_json", &combined_json, false);
+        // Invalidate cached data that doesn't have this cast applied
+        fast_cache::clear();
     }
 
     if compress | compress_string_to_numeric {
@@ -342,6 +408,22 @@ pub fn file_summary(
         t_stats += t0.elapsed();
     }
 
+    // `compress` already ran a real scan (intelligent_downcast, above) to
+    // pick the tightest safe integer DataType per column - that's strictly
+    // more authoritative than footer stats, so map it directly (Int8->Byte,
+    // not the conservative Int8->Int upcast `map_polars_to_stata` uses when
+    // it has no evidence about the actual data). Without this, `compress`'s
+    // narrowing was silently re-widened one level by that same default
+    // mapping when schema_with_stata_types ran on the already-narrowed
+    // schema. Parquet without `compress` uses the cheap footer-stats path.
+    let type_overrides = if compress {
+        direct_integer_type_overrides(&matched_schema, &cast_map)
+    } else if matches!(input_format, InputFormat::Parquet) {
+        safe_integer_type_overrides(path, &matched_schema, &cast_map)
+    } else {
+        HashMap::new()
+    };
+
     let t0 = Instant::now();
     schema_with_stata_types(
         &df,
@@ -349,13 +431,8 @@ pub fn file_summary(
         quietly,
         detailed,
         if detailed { Some(&string_lengths) } else { None },
+        if type_overrides.is_empty() { None } else { Some(&type_overrides) },
     );
-
-    if matches!(input_format, InputFormat::Parquet) {
-        set_stata_metadata_macros(path, &matched_cols);
-    } else {
-        clear_stata_metadata_macros(matched_cols.len());
-    }
 
     let n_vars = matched_schema.len();
     
@@ -391,63 +468,149 @@ pub fn file_summary(
     return 0 as ST_retcode;
 }
 
-fn set_stata_metadata_macros(path: &str, matched_cols: &[String]) {
-    let metadata = read_stata_variable_metadata(path);
-    set_macro("stata_metadata_present", if metadata.is_empty() { "0" } else { "1" }, false);
-
-    for (idx, name) in matched_cols.iter().enumerate() {
-        let i = idx + 1;
-        let info = metadata.get(name);
-        set_macro(
-            &format!("stata_label_{}", i),
-            info.map(|m| m.label.as_str()).unwrap_or(""),
-            false,
-        );
-        set_macro(
-            &format!("stata_comment_{}", i),
-            info.map(|m| m.comment.as_str()).unwrap_or(""),
-            false,
-        );
-        set_macro(
-            &format!("stata_format_{}", i),
-            info.map(|m| m.format.as_str()).unwrap_or(""),
-            false,
-        );
-        set_macro(
-            &format!("stata_declared_type_{}", i),
-            info.map(|m| m.stata_type.as_str()).unwrap_or(""),
-            false,
-        );
-        set_macro(
-            &format!("stata_value_label_name_{}", i),
-            info.map(|m| m.value_label_name.as_str()).unwrap_or(""),
-            false,
-        );
-        let value_labels = info.map(|m| m.value_labels.as_slice()).unwrap_or(&[]);
-        set_macro(&format!("stata_value_label_count_{}", i), &value_labels.len().to_string(), false);
-        for (j, item) in value_labels.iter().enumerate() {
-            set_macro(&format!("stata_value_label_value_{}_{}", i, j + 1), &item.value, false);
-            set_macro(&format!("stata_value_label_text_{}_{}", i, j + 1), &item.label, false);
-        }
-        let notes = info.map(|m| m.notes.as_slice()).unwrap_or(&[]);
-        set_macro(&format!("stata_note_count_{}", i), &notes.len().to_string(), false);
-        for (j, note) in notes.iter().enumerate() {
-            set_macro(&format!("stata_note_{}_{}", i, j + 1), note, false);
-        }
-    }
+/// Maps every already-narrowed integer column straight to its Stata type
+/// (Int8->Byte, Int16->Int, Int32->Long - no upcast), for use after
+/// `compress` has already picked that DataType via a real min/max scan.
+/// Unlike `safe_integer_type_overrides`, no independent verification is
+/// needed here: `intelligent_downcast` only ever narrows to a type the
+/// actual observed values already fit. Excludes: Int64/UInt64 (Stata has no
+/// native 64-bit integer - stays on the existing double/safe_int64-string
+/// path unchanged) and any column the caller already cast explicitly
+/// (`cast()` or the safe_int64 auto-promotion), whose requested type must
+/// win outright rather than be silently re-decided here.
+fn direct_integer_type_overrides(
+    schema: &Schema,
+    cast_map: &HashMap<String, String>,
+) -> HashMap<String, StataType> {
+    schema
+        .iter()
+        .filter_map(|(name, dtype)| {
+            if cast_map.contains_key(name.as_str()) {
+                return None;
+            }
+            if !matches!(
+                dtype,
+                DataType::Int8 | DataType::Int16 | DataType::Int32 |
+                DataType::UInt8 | DataType::UInt16 | DataType::UInt32
+            ) {
+                return None;
+            }
+            let type_str = polars_type_to_stata_type(&format!("{:?}", dtype).to_lowercase());
+            StataType::from_str(type_str).map(|t| (name.to_string(), t))
+        })
+        .collect()
 }
 
-fn clear_stata_metadata_macros(n_cols: usize) {
-    set_macro("stata_metadata_present", "0", false);
-    for i in 1..=n_cols {
-        set_macro(&format!("stata_label_{}", i), "", false);
-        set_macro(&format!("stata_comment_{}", i), "", false);
-        set_macro(&format!("stata_format_{}", i), "", false);
-        set_macro(&format!("stata_declared_type_{}", i), "", false);
-        set_macro(&format!("stata_value_label_name_{}", i), "", false);
-        set_macro(&format!("stata_value_label_count_{}", i), "0", false);
-        set_macro(&format!("stata_note_count_{}", i), "0", false);
+/// PARQUET, non-compress reads only: a safe, tighter-than-default integer
+/// type per column, computed from Parquet row-group footer statistics (no
+/// data scan) and optionally widened by a Stata type recorded in the file's
+/// own metadata footer. A column appears here ONLY when the footer stats
+/// independently verify the range is safe - a stale, wrong, or absent
+/// recorded type can never narrow a column below that verified floor, and a
+/// column whose stats can't be cheaply verified is simply absent, leaving it
+/// to fall back to the existing conservative default mapping in
+/// `map_polars_to_stata` (see mapping::schema_with_stata_types). Excludes:
+/// Int64/UInt64 (Stata has no native 64-bit integer - the existing
+/// double/safe_int64-string handling in `find_int64_precision_overflow_columns`
+/// is a separate, deliberate safety mechanism this doesn't touch) and any
+/// column the caller already cast explicitly, same reasoning as above.
+fn safe_integer_type_overrides(
+    path: &str,
+    schema: &Schema,
+    cast_map: &HashMap<String, String>,
+) -> HashMap<String, StataType> {
+    let integer_cols: Vec<String> = schema
+        .iter()
+        .filter_map(|(name, dtype)| {
+            if cast_map.contains_key(name.as_str()) {
+                return None;
+            }
+            if matches!(
+                dtype,
+                DataType::Int8 | DataType::Int16 | DataType::Int32 |
+                DataType::UInt8 | DataType::UInt16 | DataType::UInt32
+            ) {
+                Some(name.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if integer_cols.is_empty() {
+        return HashMap::new();
     }
+
+    let verified_ranges = integer_ranges_for_path(path, &integer_cols);
+    if verified_ranges.is_empty() {
+        return HashMap::new();
+    }
+
+    // Best-effort: a conflicting or unreadable metadata footer just means no
+    // recorded type to widen with - never an error surfaced from `describe`,
+    // which has never required metadata to be present or consistent.
+    let recorded_types: HashMap<String, StataType> = read_metadata_validated(path)
+        .ok()
+        .flatten()
+        .map(|envelope| {
+            envelope
+                .variables
+                .into_iter()
+                .filter_map(|(name, meta)| {
+                    meta.stata_type
+                        .as_deref()
+                        .and_then(StataType::from_str)
+                        .map(|t| (name, t))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut overrides = HashMap::with_capacity(verified_ranges.len());
+    for (name, (min_val, max_val)) in verified_ranges {
+        let optimal_dtype = find_optimal_integer_type(min_val, max_val, true);
+        let type_str = polars_type_to_stata_type(&format!("{:?}", optimal_dtype).to_lowercase());
+        let Some(verified_safe) = StataType::from_str(type_str) else { continue };
+        let recorded = recorded_types.get(&name).copied();
+        overrides.insert(name, widen_with_recorded_type(verified_safe, recorded));
+    }
+    overrides
+}
+
+/// Stata doubles only preserve integer precision up to 2^53. Return the subset of
+/// `candidates` (Int64/UInt64 columns) whose min or max, cast to f64, falls outside
+/// that range. Uses a single min/max aggregation over just the candidate columns
+/// rather than collecting the full frame.
+fn find_int64_precision_overflow_columns(
+    df: &LazyFrame,
+    candidates: &[PlSmallStr],
+) -> Result<Vec<PlSmallStr>, PolarsError> {
+    const MAX_SAFE_INT_AS_DOUBLE: f64 = 9_007_199_254_740_992.0; // 2^53
+
+    let stats_exprs: Vec<Expr> = candidates
+        .iter()
+        .flat_map(|name| {
+            vec![
+                col(name.as_str()).cast(DataType::Float64).min().alias(&format!("{}_min", name)),
+                col(name.as_str()).cast(DataType::Float64).max().alias(&format!("{}_max", name)),
+            ]
+        })
+        .collect();
+
+    let stats_df = df.clone().select(stats_exprs).collect_with_engine(Engine::Streaming)?.unwrap_single();
+
+    let mut overflow_cols = Vec::new();
+    for name in candidates {
+        let min_val = stats_df.column(&format!("{}_min", name))?.f64()?.get(0);
+        let max_val = stats_df.column(&format!("{}_max", name))?.f64()?.get(0);
+        let overflows = min_val.map(|v| v < -MAX_SAFE_INT_AS_DOUBLE).unwrap_or(false)
+            || max_val.map(|v| v > MAX_SAFE_INT_AS_DOUBLE).unwrap_or(false);
+        if overflows {
+            overflow_cols.push(name.clone());
+        }
+    }
+
+    Ok(overflow_cols)
 }
 
 fn collect_row_count_and_string_lengths(
@@ -471,7 +634,9 @@ fn collect_row_count_and_string_lengths(
         );
     }
 
-    let result_df = df.clone().select(exprs).collect()?;
+    // Streaming keeps memory bounded: the in-memory engine would materialize every
+    // (filtered) string column across all files before taking the max.
+    let result_df = df.clone().select(exprs).collect_with_engine(Engine::Streaming)?.unwrap_single();
 
     let n_rows = result_df
         .column("__n_rows")?
@@ -530,8 +695,9 @@ pub fn get_row_count(lazy_df: &LazyFrame) -> Result<usize, PolarsError> {
 
     let count_df = lazy_df.clone()
                                 .select([len().alias("n_rows")])
-                                .collect()
-                                .unwrap();
+                                .collect_with_engine(Engine::Streaming)
+                                .unwrap()
+                                .unwrap_single();
 
     let count = count_df.column("n_rows").unwrap().get(0).unwrap().try_extract::<usize>().unwrap();
     Ok(count)
@@ -551,7 +717,7 @@ fn collect_row_count_and_string_lengths_from_df(
             let len = df.column(name.as_str())
                 .ok()
                 .and_then(|col| col.str().ok().map(|ca| {
-                    ca.into_iter()
+                    ca.iter()
                         .filter_map(|s| s.map(|s| s.len()))
                         .max()
                         .unwrap_or(0)
@@ -564,8 +730,13 @@ fn collect_row_count_and_string_lengths_from_df(
     (n_rows, string_lengths)
 }
 
-/// Sum file sizes for path (supports glob patterns).
+/// Sum file sizes for path (supports glob patterns and hive-partitioned directories).
 fn total_file_size_bytes(path: &str) -> u64 {
+    // A directory's own metadata length is 0 (or tiny), which would make any hive
+    // dataset look small enough for fast mode and collect it whole into memory.
+    if std::path::Path::new(path).is_dir() {
+        return dir_size_bytes(std::path::Path::new(path));
+    }
     let normalized = normalize_path_separators(path);
     if let Ok(paths) = glob(&normalized) {
         let total: u64 = paths
@@ -577,4 +748,21 @@ fn total_file_size_bytes(path: &str) -> u64 {
     }
     // Fallback: single-file stat (handles non-glob paths that didn't match above)
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(u64::MAX)
+}
+
+fn dir_size_bytes(dir: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return u64::MAX;
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .map(|e| {
+            let p = e.path();
+            if p.is_dir() {
+                dir_size_bytes(&p)
+            } else {
+                std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0)
+            }
+        })
+        .fold(0u64, |acc, n| acc.saturating_add(n))
 }

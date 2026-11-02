@@ -1,18 +1,20 @@
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
 use std::slice;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 
 pub mod read;
 pub mod write;
 pub mod mapping;
 pub mod stata_interface;
+pub mod stata_metadata;
 pub mod describe;
 pub mod sql_from_if;
 pub mod utilities;
 pub mod downcast;
 pub mod fast_cache;
-pub mod parquet_metadata;
+pub mod parquet_stats;
 
 use std::ptr;
 
@@ -32,10 +34,32 @@ use read::{
 #[no_mangle]
 pub static mut _stata_: *mut stata_sys::ST_plugin = ptr::null_mut();
 
+// Set the first time any subfunction other than "setup_check"/"set_threads" runs.
+// Polars' global rayon thread pool (and our own, in utilities::get_thread_pool) is
+// lazily built on first use and reads POLARS_MAX_THREADS exactly once, so
+// "set_threads" can only take effect before that first use - this flag is how we
+// detect it's too late.
+static POLARS_TOUCHED: AtomicBool = AtomicBool::new(false);
+
 #[no_mangle]
 pub extern "C" fn pginit(p: *mut stata_sys::ST_plugin) -> stata_sys::ST_retcode {
     unsafe {
         _stata_ = p;
+    }
+    // polars' defaults scan every file of a multi-file dataset at once and prefetch
+    // 2 x n_threads row groups per file. Reads keep row order, so everything ahead of
+    // the current file is buffered - close to the whole dataset in memory. These
+    // limits keep peak memory to a few row groups (and were faster in testing).
+    // Set here, before polars starts any threads; user-set values win.
+    for (name, value) in [
+        ("POLARS_MAX_CONCURRENT_SCANS", "2"),
+        ("POLARS_ROW_GROUP_PREFETCH_SIZE", "4"),
+    ] {
+        if std::env::var_os(name).is_none() {
+            unsafe {
+                std::env::set_var(name, value);
+            }
+        }
     }
     polars::datatypes::extension::set_unknown_extension_type_behavior(
         polars::datatypes::extension::UnknownExtensionTypeBehavior::LoadAsStorage,
@@ -80,11 +104,46 @@ pub extern "C" fn stata_call(argc: c_int, argv: *const *const c_char) -> ST_retc
         
         let subfunction_name = args[0];
         let subfunction_args = &args[1..];
-        
-        
+
+        if subfunction_name != "setup_check" && subfunction_name != "set_threads" {
+            POLARS_TOUCHED.store(true, Ordering::SeqCst);
+        }
+
         // Call the appropriate subfunction
         match subfunction_name {
             "setup_check" => {
+                return 0 as ST_retcode;
+            }
+            "set_threads" => {
+                let n_str = subfunction_args.first().copied().unwrap_or("").trim();
+                let n_threads = match n_str.parse::<usize>() {
+                    Ok(n) if n >= 1 => n,
+                    _ => {
+                        display(&format!(
+                            "Invalid thread count '{}': must be a positive integer",
+                            n_str
+                        ));
+                        return 198 as ST_retcode;
+                    }
+                };
+                if POLARS_TOUCHED.load(Ordering::SeqCst) {
+                    display(
+                        "Cannot set thread count: polars has already started in this Stata \
+                         session (a pq command has already run). Run `pq set_threads` before \
+                         any other pq command to change the thread count.",
+                    );
+                    return 198 as ST_retcode;
+                }
+                // SAFETY: single-threaded at this point - no other pq subfunction has run
+                // yet (checked above), so polars' thread pool and rayon workers have not
+                // been spawned and nothing else can be concurrently reading this var.
+                unsafe {
+                    std::env::set_var("POLARS_MAX_THREADS", n_threads.to_string());
+                }
+                display(&format!(
+                    "polars will use {} thread(s) for this Stata session.",
+                    n_threads
+                ));
                 return 0 as ST_retcode;
             }
             "read" => {
@@ -134,6 +193,7 @@ pub extern "C" fn stata_call(argc: c_int, argv: *const *const c_char) -> ST_retc
                     false
                 };
                 let columns_varlist = if subfunction_args.len() > 19 { subfunction_args[19] } else { "" };
+                let skip_metadata = subfunction_args.get(20).map(|s| *s == "1").unwrap_or(false);
                 let input_format = match InputFormat::from_str(format_arg) {
                     Some(f) => f,
                     None => {
@@ -163,6 +223,7 @@ pub extern "C" fn stata_call(argc: c_int, argv: *const *const c_char) -> ST_retc
                     infer_schema_length,
                     parse_dates,
                     columns_varlist,
+                    skip_metadata,
                 );
         
                 // Use match to handle the Result
@@ -240,6 +301,7 @@ pub extern "C" fn stata_call(argc: c_int, argv: *const *const c_char) -> ST_retc
                 };
                 let binary_to_string = if subfunction_args.len() > 15 { subfunction_args[15] == "1" } else { false };
                 let cast_strict = if subfunction_args.len() > 16 { subfunction_args[16] != "0" } else { true };
+                let safe_int64 = if subfunction_args.len() > 17 { subfunction_args[17] == "1" } else { false };
                 return file_summary(
                         subfunction_args[0],
                         subfunction_args[1].parse::<u8>().unwrap_or(0) != 0,
@@ -259,6 +321,7 @@ pub extern "C" fn stata_call(argc: c_int, argv: *const *const c_char) -> ST_retc
                         user_cast_json,
                         binary_to_string,
                         cast_strict,
+                        safe_int64,
                     ) as ST_retcode;
             },
             "save" => {
@@ -308,6 +371,19 @@ pub extern "C" fn stata_call(argc: c_int, argv: *const *const c_char) -> ST_retc
                     Err(_e) => 198 as i32
                 };
                 return output as ST_retcode;
+            },
+            "describe_stata_metadata" => {
+                if !data_exists(&subfunction_args[0]) {
+                    stata_interface::display(&format!("File does not exist ({})",subfunction_args[0]));
+                    return 601 as ST_retcode;
+                }
+                let path = subfunction_args[0];
+                let quietly = subfunction_args.get(1).map(|s| *s == "1").unwrap_or(false);
+                if let Err(e) = stata_metadata::describe_metadata(path, quietly) {
+                    display(&format!("Error reading embedded Stata metadata: {e}"));
+                    return 198 as ST_retcode;
+                }
+                return 0 as ST_retcode;
             },
             "write_overflow_dta" => {
                 if !data_exists(&subfunction_args[0]) {
