@@ -39,8 +39,12 @@ HINT_FIELDS = ("format", "stata_type")
 
 
 def read_metadata(path):
-    md = pq.read_schema(path).metadata or {}
-    raw = md.get(STATA_META_KEY)
+    # Read the Parquet FOOTER key/value metadata, where both pyarrow and
+    # polars/Stata store the envelope. pq.read_schema().metadata is the Arrow
+    # *schema* metadata, which a polars/Stata-written file does not populate
+    # with this key -- reading there returns None for a perfectly good file.
+    kv = pq.ParquetFile(path).metadata.metadata or {}
+    raw = kv.get(STATA_META_KEY)
     return json.loads(raw) if raw is not None else None
 
 

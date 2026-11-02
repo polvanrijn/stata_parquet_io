@@ -109,10 +109,16 @@ def write_stata_parquet(path, table, envelope, existing_metadata=None):
 
 
 def read_stata_metadata(path):
-    """Return the parsed Stata metadata envelope, or None if the file has none."""
-    schema = pq.read_schema(path)
-    md = schema.metadata or {}
-    raw = md.get(STATA_META_KEY)
+    """Return the parsed Stata metadata envelope, or None if the file has none.
+
+    Reads the Parquet *footer* key/value metadata, which is where both this
+    writer and Stata's `pq save` store the envelope. Do NOT use
+    ``pq.read_schema(path).metadata`` here: that returns the Arrow *schema*
+    metadata, and a file written by polars/Stata carries the key only in the
+    footer -- it would read back as None.
+    """
+    kv = pq.ParquetFile(path).metadata.metadata or {}
+    raw = kv.get(STATA_META_KEY)
     if raw is None:
         return None
     return json.loads(raw)
