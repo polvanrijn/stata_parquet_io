@@ -43,9 +43,11 @@ di as res "Loaded Python-made parquet OK"
 di as txt "{hline 50}"
 
 *-------------------------------------------------------------------------------
-* 3.  Re-save from Stata -- metadata is written back into the new parquet
+* 3.  Re-save from Stata -- the `statametadata' option is REQUIRED to write the
+*     labels/value labels/notes/formats back into the parquet footer. Without
+*     it `pq save' writes the data only and the metadata is dropped.
 *-------------------------------------------------------------------------------
-pq save "`OUTFILE'", replace
+pq save "`OUTFILE'", replace statametadata
 di as res _n "Re-saved to `OUTFILE'."
 di as txt "Verify from the shell with:"
 di as txt "    uv run examples/python_verify.py `INFILE' `OUTFILE'"
