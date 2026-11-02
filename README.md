@@ -115,6 +115,26 @@ Benchmarks run on AMD Ryzen 7 8845HS, 14 GB RAM, Windows 11, Stata 17 SE. See [b
 - **`if()` uses SQL semantics**: missing values are not treated as greater than any value (unlike Stata's native `if`).
 - **CSV date filters**: use ISO literals (`DATE '2020-01-05'`) rather than Stata's `td()`/`tc()` functions inside `if()`.
 
+## Python interoperability
+
+The Stata metadata `pq save` embeds (labels, value labels, notes, formats,
+storage types) lives in the Parquet footer under the key
+`org.stata.pq.labels.v1`, so Python can both read it and write it. See
+[`examples/`](examples):
+
+- [`python_stata_metadata.py`](examples/python_stata_metadata.py) — write a
+  Parquet file from Python carrying Stata metadata (and read it back).
+- [`python_roundtrip.do`](examples/python_roundtrip.do) — `pq use` that file
+  in Stata and `pq save` it again.
+- [`python_verify.py`](examples/python_verify.py) — confirm the
+  Python → Stata → Python round trip preserved both data and metadata.
+
+```bash
+uv run examples/python_stata_metadata.py python_made.parquet
+# ...run examples/python_roundtrip.do in Stata...
+uv run examples/python_verify.py python_made.parquet stata_resaved.parquet
+```
+
 ## Building from source
 
 See [BUILDING.md](BUILDING.md) for native builds, cross-compiling to Windows
