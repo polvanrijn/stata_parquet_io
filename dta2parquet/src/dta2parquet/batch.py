@@ -25,6 +25,7 @@ import os
 import socket
 import threading
 import time
+import uuid
 import zlib
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import asdict, dataclass
@@ -106,26 +107,65 @@ class Claim:
         except FileExistsError:
             return False
         with os.fdopen(fd, "w") as fh:
-            json.dump({"host": HOST, "pid": os.getpid(), "started": time.time()}, fh)
+            # the random token makes every lock's content unique (see _take_over)
+            json.dump({"host": HOST, "pid": os.getpid(), "started": time.time(),
+                       "token": uuid.uuid4().hex}, fh)
         return True
+
+    def _fs_now(self) -> float:
+        """Current time *as the file server sees it*.
+
+        Lock ages are file mtimes stamped by the server, so comparing them with
+        this machine's clock would let clock skew between machines make a live
+        lock look stale (or a dead one look alive). Touching a probe file in the
+        same directory gives a timestamp from the same clock.
+        """
+        probe = f"{self.lock}.probe-{HOST}-{os.getpid()}-{threading.get_ident()}"
+        try:
+            with open(probe, "w"):
+                pass
+            return os.stat(probe).st_mtime
+        except OSError:
+            return time.time()
+        finally:
+            try:
+                os.unlink(probe)
+            except OSError:
+                pass
+
+    def _take_over(self) -> bool:
+        """Replace a stale lock with ours. Safe when several machines race."""
+        try:
+            with open(self.lock) as fh:
+                before = fh.read()
+            if self._fs_now() - os.stat(self.lock).st_mtime < self.stale_after:
+                return False
+        except FileNotFoundError:
+            return self._create()
+        aside = f"{self.lock}.stale-{HOST}-{os.getpid()}"
+        try:
+            os.rename(self.lock, aside)  # atomic: one racer moves any given file
+        except FileNotFoundError:
+            return self._create()  # someone else moved it first
+        with open(aside) as fh:
+            moved = fh.read()
+        if moved != before:
+            # between our check and the rename another machine took the stale
+            # lock over and created a fresh one - which we just moved. Put it
+            # back (link fails rather than overwrite if a lock exists again).
+            try:
+                os.link(aside, self.lock)
+            except FileExistsError:
+                pass
+            os.unlink(aside)
+            return False
+        os.unlink(aside)
+        return self._create()
 
     def acquire(self) -> bool:
         os.makedirs(os.path.dirname(os.path.abspath(self.lock)), exist_ok=True)
-        if not self._create():
-            try:
-                age = time.time() - os.stat(self.lock).st_mtime
-            except FileNotFoundError:
-                age = None
-            if age is not None and age < self.stale_after:
-                return False
-            # stale: move it aside atomically - only one taker can win
-            try:
-                os.rename(self.lock, f"{self.lock}.stale-{HOST}-{os.getpid()}")
-                os.unlink(f"{self.lock}.stale-{HOST}-{os.getpid()}")
-            except FileNotFoundError:
-                pass
-            if not self._create():
-                return False
+        if not self._create() and not self._take_over():
+            return False
         self._thread = threading.Thread(target=self._beat, daemon=True)
         self._thread.start()
         return True
@@ -156,16 +196,36 @@ class Outcome:
     result: dict | None = None
 
 
-def _work(job: Job, opts: ConvertOptions, claim: bool, overwrite: bool, stale_after: float, heartbeat: float) -> Outcome:
-    if os.path.exists(job.dst) and not overwrite:
+def _is_done(job: Job, overwrite: bool, update: bool) -> bool:
+    """Whether job.dst already holds a result we should keep."""
+    if overwrite:
+        return False
+    try:
+        dst_mtime = os.stat(job.dst).st_mtime
+    except FileNotFoundError:
+        return False
+    return not (update and os.stat(job.src).st_mtime > dst_mtime)
+
+
+def _work(job: Job, opts: ConvertOptions, claim: bool, overwrite: bool, update: bool,
+          stale_after: float, heartbeat: float) -> Outcome:
+    if _is_done(job, overwrite, update):
         return Outcome("skipped", job.src, job.dst)
     c = Claim(job.dst, stale_after, heartbeat) if claim else None
     if c is not None and not c.acquire():
         return Outcome("busy", job.src, job.dst)
     try:
         # re-check: another machine may have finished it after our first look
-        if os.path.exists(job.dst) and not overwrite:
+        if _is_done(job, overwrite, update):
             return Outcome("skipped", job.src, job.dst)
+        if c is not None:
+            # we own the file now: partial temp files left by a crashed
+            # machine can go (convert_file writes to its own temp name)
+            for tmp in glob.glob(glob.escape(job.dst) + ".tmp-*"):
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
         res: ConvertResult = convert_file(job.src, job.dst, opts)
         return Outcome("done", job.src, job.dst, result=asdict(res))
     except Exception as e:  # report, keep going with other files
@@ -189,6 +249,7 @@ def run_batch(
     workers: int,
     claim: bool = True,
     overwrite: bool = False,
+    update: bool = False,
     stale_after: float = 600.0,
     heartbeat: float = 30.0,
     log_path: str | None = None,
@@ -221,7 +282,7 @@ def run_batch(
         else:
             print(f"[{n}/{total}] {o.status:<7} {o.src}", flush=True)
 
-    args = (opts, claim, overwrite, stale_after, heartbeat)
+    args = (opts, claim, overwrite, update, stale_after, heartbeat)
     try:
         if workers <= 1:
             for j in jobs:

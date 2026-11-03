@@ -8,14 +8,21 @@ The metadata is embedded exactly the way `pq save, statametadata` from the
 (the `org.stata.pq.labels.v1` key in the Parquet footer), so `pq use` in Stata
 restores everything, and other tools can read it too.
 
-* **Fast.** The `.dta` is memory-mapped and decoded column by column with
-  numpy (no per-cell Python objects), and the Parquet is written by polars'
-  parallel streaming writer, the same writer `pq save` uses. On a 4-core VM a
-  650 MB file (5M rows × 29 columns) takes **2.9 s**. For comparison,
-  `pandas.read_stata` + `to_parquet` takes 21.6 s and `pyreadstat` needs
-  44.8 s just to read the file.
-* **Bounded memory.** It streams in chunks (`--chunk-mb`, 128 MB of `.dta`
-  by default), so files bigger than RAM are fine.
+* **Fast.** The `.dta` is read in large sequential chunks and decoded column
+  by column with numpy (no per-cell Python objects). The Parquet is written
+  by polars' parallel streaming writer, the same writer `pq save` uses.
+  Measured on a 4-core VM:
+
+  | File                              | dta2parquet | pandas `read_stata` + `to_parquet` | pyreadstat (read only) |
+  |-----------------------------------|-------------|------------------------------------|------------------------|
+  | 650 MB (5M rows × 29 columns)     | 3–4 s       | 21.6 s                             | 44.8 s                 |
+  | 2.6 GB (20M rows × 29 columns)    | 9 s         | not run                            | not run                |
+
+* **Bounded memory.** It works through the file in chunks (`--chunk-mb`,
+  64 MB by default), so files bigger than RAM are fine. Peak memory stays
+  around 1 GB per file with the defaults and 4 threads: about 0.95 GB for the
+  650 MB file and 1.1 GB for the 2.6 GB one. Lower `--chunk-mb` or
+  `--threads` if you run many files at once on a small machine.
 * **Scales out.** `batch` converts many files in parallel, and several
   machines can share the work (see below).
 * **Safe.** Each output is written to a temp file, checked (row and column
@@ -68,8 +75,9 @@ fewer jobs with more threads. When you have many small ones, use more jobs.
 Files are processed biggest first.
 
 Already converted outputs are skipped, so an interrupted run resumes when
-you re-run the same command. `--overwrite` redoes them. `--log run.jsonl`
-appends one JSON record per file (host, timings, errors).
+you re-run the same command. `--update` redoes a file only when its `.dta`
+is newer than its `.parquet`, and `--overwrite` redoes everything.
+`--log run.jsonl` appends one JSON record per file (host, timings, errors).
 
 ## Spreading the work over several computers
 
@@ -90,6 +98,12 @@ converts a file it keeps refreshing the lock. A lock that has not been
 refreshed for `--stale-after` minutes (default 10) belongs to a crashed
 machine, and the next run takes it over. Just re-run the command to pick up
 anything that was left over.
+
+The lock age is measured with the file server's clock, so machines whose
+clocks disagree don't mistake each other's live locks for stale ones. When a
+machine takes over a stale lock it also deletes the half-written temp file
+the crashed machine left behind. Input is read in large sequential chunks,
+which suits network filesystems.
 
 **Option 2: static shards (no shared output needed).** Give each machine a
 fixed slice of the files with `--shard K/N`:

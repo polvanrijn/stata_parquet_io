@@ -4,9 +4,10 @@ Supports dta formats 113, 114, 115 (Stata 8-13) and 117, 118, 119
 (Stata 13+), in either byte order.
 
 Unlike general-purpose readers (pandas, pyreadstat) this one never builds
-Python objects per cell: the data section is memory-mapped and each column
-is extracted with numpy strided views, so converting a chunk of rows costs
-roughly one memcpy per column. It also exposes everything the Stata
+Python objects per cell: rows are read in large sequential chunks and each
+column is extracted with numpy strided views, so converting a chunk of rows
+costs roughly one memcpy per column. Metadata and strL payloads are read
+through a memory map. It also exposes everything the Stata
 metadata envelope needs - including *characteristics* (variable and
 dataset notes live there), which the common readers do not surface.
 """
@@ -98,6 +99,28 @@ class DtaFile:
         a = self.data_offset + start * self.row_width
         b = self.data_offset + stop * self.row_width
         return self._buf[a:b].reshape(stop - start, self.row_width)
+
+    def read_rows(self, start: int, stop: int) -> np.ndarray:
+        """Rows [start, stop) as a private (n_rows, row_width) uint8 array.
+
+        Uses one large sequential read rather than page faults on the memory
+        map: column-wise access through the map turns into many small,
+        scattered reads, which is slow on network filesystems (NFS, SMB,
+        Lustre) - exactly where multi-machine conversions usually read from.
+        Thread-safe: every call uses its own file handle.
+        """
+        n = stop - start
+        out = np.empty(n * self.row_width, dtype=np.uint8)
+        view = memoryview(out)
+        got = 0
+        with open(self.path, "rb", buffering=0) as fh:
+            fh.seek(self.data_offset + start * self.row_width)
+            while got < len(view):
+                k = fh.readinto(view[got:])
+                if not k:
+                    raise DtaFormatError(f"{self.path}: unexpected end of file (truncated file?)")
+                got += k
+        return out.reshape(n, self.row_width)
 
     def decode(self, raw: bytes) -> str:
         return raw.split(b"\x00", 1)[0].decode(self.encoding, errors="replace")

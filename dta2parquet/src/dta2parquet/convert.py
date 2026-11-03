@@ -49,7 +49,7 @@ _NUMERIC = {
 class ConvertOptions:
     compression: str = "zstd"
     compression_level: int | None = None
-    chunk_bytes: int = 128 * 1024 * 1024  # raw .dta bytes converted per chunk
+    chunk_bytes: int = 64 * 1024 * 1024  # raw .dta bytes converted per chunk
     row_group_rows: int | None = None  # fixed Parquet row-group size
     engine: str = "polars"  # "polars" (parallel writer) or "pyarrow"
     threads: int = 4  # threads converting chunks ahead of the writer
@@ -73,20 +73,20 @@ class ConvertResult:
 # ======================================================================
 
 
-def _strided(dta: D.DtaFile, var: D.Variable, start: int, stop: int, dtype: str) -> np.ndarray:
-    """Zero-copy strided view of one numeric column over rows [start, stop)."""
+def _strided(rows: np.ndarray, var: D.Variable, dtype: str) -> np.ndarray:
+    """Zero-copy strided view of one numeric column of a (n, row_width) chunk."""
     return np.ndarray(
-        shape=(stop - start,),
-        dtype=np.dtype(dta.byteorder + dtype),
-        buffer=dta.buffer,
-        offset=dta.data_offset + start * dta.row_width + var.offset,
-        strides=(dta.row_width,),
+        shape=(rows.shape[0],),
+        dtype=np.dtype(dtype),
+        buffer=rows,
+        offset=var.offset,
+        strides=(rows.shape[1],),
     )
 
 
-def _numeric(dta, var, start, stop, kind) -> pa.Array:
+def _numeric(dta, rows, var, kind) -> pa.Array:
     code, atype, imax = _NUMERIC[var.stata_type]
-    x = _strided(dta, var, start, stop, code)
+    x = _strided(rows, var, dta.byteorder + code)
     x = x.astype(x.dtype.newbyteorder("="), copy=True)  # contiguous, native order
     if imax is not None:
         missing = x > imax
@@ -165,25 +165,27 @@ def _string_array(data: np.ndarray, offsets: np.ndarray, n: int, enc: str) -> pa
     return pa.LargeStringArray.from_buffers(n, pa.py_buffer(offsets), pa.py_buffer(data))
 
 
-def _fixed_str(dta, var, start, stop) -> pa.Array:
-    n = stop - start
+def _fixed_str(dta, rows, var) -> pa.Array:
+    n = rows.shape[0]
     w = var.width
-    cells = dta.rows(start, stop)[:, var.offset : var.offset + w]
+    # contiguous copy first: the elementwise passes below are ~3x faster on
+    # contiguous memory than on the strided column slice
+    cells = np.ascontiguousarray(rows[:, var.offset : var.offset + w])
     nul = cells == 0
     has_nul = nul.any(axis=1)
     lens = np.where(has_nul, nul.argmax(axis=1), w).astype(np.int64)
     offsets = np.zeros(n + 1, dtype=np.int64)
     np.cumsum(lens, out=offsets[1:])
     if int(offsets[-1]) == n * w:
-        data = np.ascontiguousarray(cells).reshape(-1)
+        data = cells.reshape(-1)
     else:
         data = cells[np.arange(w) < lens[:, None]]
     return _string_array(data, offsets, n, dta.encoding)
 
 
-def _strl(dta, var, start, stop, binary: bool) -> pa.Array:
-    n = stop - start
-    raw8 = dta.rows(start, stop)[:, var.offset : var.offset + 8]
+def _strl(dta, rows, var, binary: bool) -> pa.Array:
+    n = rows.shape[0]
+    raw8 = rows[:, var.offset : var.offset + 8]
     keys = D.strl_refs_to_keys(raw8, dta.release, dta.byteorder)
     gkeys, gstarts, glens, _ = dta.strl_index()
     if len(gkeys):
@@ -245,18 +247,19 @@ def _plan(dta: D.DtaFile) -> list[_ColPlan]:
     return plans
 
 
-def _convert_column(dta, p: _ColPlan, start, stop) -> pa.Array:
+def _convert_column(dta, rows, p: _ColPlan) -> pa.Array:
     if p.kind == "string":
-        return _fixed_str(dta, p.var, start, stop)
+        return _fixed_str(dta, rows, p.var)
     if p.kind == "strl":
-        return _strl(dta, p.var, start, stop, binary=False)
+        return _strl(dta, rows, p.var, binary=False)
     if p.kind == "binary":
-        return _strl(dta, p.var, start, stop, binary=True)
-    return _numeric(dta, p.var, start, stop, p.kind)
+        return _strl(dta, rows, p.var, binary=True)
+    return _numeric(dta, rows, p.var, p.kind)
 
 
 def _convert_chunk(dta, plans, schema, start, stop) -> pa.Table:
-    cols = [_convert_column(dta, p, start, stop) for p in plans]
+    rows = dta.read_rows(start, stop)
+    cols = [_convert_column(dta, rows, p) for p in plans]
     return pa.Table.from_arrays(cols, schema=schema)
 
 
@@ -273,7 +276,18 @@ def schema_for(dta: D.DtaFile, statametadata: bool = True) -> tuple[pa.Schema, l
 def _rows_per_group(dta: D.DtaFile, opts: ConvertOptions) -> int:
     if opts.row_group_rows:
         return max(1, opts.row_group_rows)
-    return int(min(max(opts.chunk_bytes // max(dta.row_width, 1), 8192), 4_000_000))
+    # bytes a row costs once converted: its fixed width plus, per strL
+    # column, the average text it points to. That text lives outside the row
+    # and is deduplicated in the file (many rows can share one stored copy),
+    # but conversion materializes it for every row - so use the mean length
+    # of a stored entry, not total stored bytes / rows.
+    per_row = float(max(dta.row_width, 1))
+    n_strl = sum(v.stata_type == "strl" for v in dta.variables)
+    if n_strl:
+        lens = dta.strl_index()[2]
+        if len(lens):
+            per_row += n_strl * float(lens.mean())
+    return int(min(max(opts.chunk_bytes // per_row, 1), 4_000_000))
 
 
 def _iter_tables(dta, plans, schema, bounds, threads):

@@ -29,8 +29,9 @@ def _add_convert_options(p: argparse.ArgumentParser) -> None:
     g.add_argument("--engine", default="polars", choices=["polars", "pyarrow"],
                    help="Parquet writer: polars (default; parallel, same writer as pq save) "
                         "or pyarrow (single-threaded)")
-    g.add_argument("--chunk-mb", type=float, default=128,
-                   help="MB of .dta data converted per chunk; bounds memory use (default: 128)")
+    g.add_argument("--chunk-mb", type=float, default=64,
+                   help="MB of .dta data converted per chunk. Peak memory per file is "
+                        "roughly (threads + 2) x 2-3 x this (default: 64)")
     g.add_argument("--row-group-rows", type=int, default=None,
                    help="fixed rows per Parquet row group (default: writer's choice)")
     g.add_argument("--threads", type=int, default=None,
@@ -97,6 +98,7 @@ def cmd_batch(a) -> int:
         workers=workers,
         claim=not a.no_claim,
         overwrite=a.overwrite,
+        update=a.update,
         stale_after=a.stale_after * 60,
         heartbeat=min(30.0, a.stale_after * 60 / 4),
         log_path=a.log,
@@ -166,6 +168,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="take over locks without heartbeat for this many minutes (default: 10)")
     p.add_argument("--pattern", default="*.dta", help="file pattern inside directories")
     p.add_argument("--overwrite", action="store_true", help="redo files whose output exists")
+    p.add_argument("--update", action="store_true",
+                   help="redo files whose .dta is newer than their existing .parquet")
     p.add_argument("--log", default=None, help="append one JSON line per file to this file")
     p.add_argument("--dry-run", action="store_true", help="list the work and exit")
     p.add_argument("-q", "--quiet", action="store_true", help="only print failures and the summary")

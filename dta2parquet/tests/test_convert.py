@@ -255,3 +255,79 @@ def test_error_mid_stream_leaves_nothing_behind(engine, tmp_path, monkeypatch):
     with pytest.raises(OSError, match="disk on fire"):
         convert_file(src, tmp_path / "f.parquet", ConvertOptions(row_group_rows=100, threads=2, engine=engine))
     assert [p.name for p in tmp_path.iterdir()] == ["f.dta"]
+
+
+def test_stale_lock_takeover_races_and_cleanup(tmp_path):
+    from dta2parquet.batch import Claim
+
+    dst = str(tmp_path / "x.parquet")
+    lock = dst + ".lock"
+    with open(lock, "w") as fh:
+        fh.write('{"host": "dead"}')
+    os.utime(lock, (0, 0))
+    a, b = Claim(dst, 60, 3600), Claim(dst, 60, 3600)
+    assert a.acquire()  # took the stale lock over
+    assert not b.acquire()  # a's lock is fresh
+    with open(lock) as fh:
+        owner = fh.read()
+
+    # b decided "stale" based on the dead lock's content, but a replaced it
+    # before b's rename: b must restore a's lock and back off
+    real_open, calls = open, []
+
+    def fake_read(path, *args, **kw):
+        if path == lock and not calls:
+            calls.append(1)
+            import io
+            return io.StringIO('{"host": "dead"}')
+        return real_open(path, *args, **kw)
+
+    import builtins
+    b._fs_now = lambda: os.stat(lock).st_mtime + 10**6  # everything looks stale
+    builtins.open, saved = fake_read, builtins.open
+    try:
+        assert not b._take_over()
+    finally:
+        builtins.open = saved
+    with open(lock) as fh:
+        assert fh.read() == owner
+    a.release()
+    assert not os.path.exists(lock)
+    assert [p.name for p in tmp_path.iterdir()] == []
+
+
+def test_batch_removes_leftover_temp_files(tmp_path):
+    src = tmp_path / "in"
+    src.mkdir()
+    _frame(20).to_stata(src / "a.dta", write_index=False, version=118)
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "a.parquet.tmp-deadhost-123").write_bytes(b"partial")
+    res = run_batch(plan_jobs([str(src)], str(out)), ConvertOptions(threads=1), workers=1)
+    assert [o.status for o in res] == ["done"]
+    assert sorted(p.name for p in out.iterdir()) == ["a.parquet"]
+
+
+def test_batch_update_redoes_newer_sources(tmp_path):
+    src = tmp_path / "in"
+    src.mkdir()
+    _frame(20).to_stata(src / "a.dta", write_index=False, version=118)
+    out = tmp_path / "out"
+    jobs = plan_jobs([str(src)], str(out))
+    assert [o.status for o in run_batch(jobs, ConvertOptions(threads=1), workers=1)] == ["done"]
+    assert [o.status for o in run_batch(jobs, ConvertOptions(threads=1), workers=1, update=True)] == ["skipped"]
+    future = os.stat(out / "a.parquet").st_mtime + 100
+    os.utime(src / "a.dta", (future, future))
+    assert [o.status for o in run_batch(jobs, ConvertOptions(threads=1), workers=1)] == ["skipped"]
+    assert [o.status for o in run_batch(jobs, ConvertOptions(threads=1), workers=1, update=True)] == ["done"]
+
+
+def test_chunk_size_accounts_for_strl_payload(tmp_path):
+    from dta2parquet import convert as C
+    from dta2parquet.dta import open_dta
+
+    src = tmp_path / "s.dta"
+    pd.DataFrame({"t": ["y" * 100_000] * 50}).to_stata(src, write_index=False, version=118, convert_strl=["t"])
+    with open_dta(src) as d:
+        # 8-byte refs alone would allow 64 MB / 8 = millions of rows per chunk
+        assert C._rows_per_group(d, ConvertOptions(chunk_bytes=1_000_000)) == 9
