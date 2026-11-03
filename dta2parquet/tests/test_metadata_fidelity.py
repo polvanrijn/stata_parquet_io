@@ -222,7 +222,12 @@ def _example_reader():
         return None
     spec = importlib.util.spec_from_file_location("python_stata_metadata", path)
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    # don't leave an examples/__pycache__ behind in the parent repo
+    saved, sys.dont_write_bytecode = sys.dont_write_bytecode, True
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        sys.dont_write_bytecode = saved
     return mod.read_stata_metadata
 
 
