@@ -79,6 +79,37 @@ you re-run the same command. `--update` redoes a file only when its `.dta`
 is newer than its `.parquet`, and `--overwrite` redoes everything.
 `--log run.jsonl` appends one JSON record per file (host, timings, errors).
 
+## Checking the results
+
+`verify` re-reads each `.dta` with
+[pyreadstat](https://github.com/Roche/pyreadstat), which is built on the
+ReadStat C library and shares no code with this converter. It then compares
+the result with the Parquet file:
+
+* **Metadata:** dataset label and notes, variable labels, display formats,
+  storage types, which value label each variable uses, and every value-label
+  code and text (including labels on `.a`–`.z`).
+* **Schema:** every column, in order, with the type `pq save` would use.
+* **Data:** rows from the start, middle and end of the file (30,000 by
+  default, `--all-rows` for every row), value by value, with Stata missing
+  values as nulls.
+
+```bash
+uv run --extra verify dta2parquet verify big.dta big.parquet
+uv run --extra verify dta2parquet verify /data/stata /data/parquet   # a whole batch
+```
+
+Text is compared ignoring trailing spaces, because ReadStat strips them.
+The converter itself keeps them exactly as stored. pyreadstat can't read
+per-variable notes or the `_pq_parquet_name` rename, so `verify` lists those
+as "not independently verifiable" instead of passing them silently. The test
+suite covers them by adding notes directly into a `.dta` file.
+
+The verifier is itself tested: the suite deliberately damages converted
+files (a changed label, a dropped value-label code, a different format, one
+altered value, an extra null, missing metadata) and checks that each change
+is reported.
+
 ## Spreading the work over several computers
 
 **Option 1: shared output folder (recommended).** Mount the input and output
@@ -162,7 +193,7 @@ Things to know:
 
 ```bash
 cd dta2parquet
-uv run pytest            # cross-checks against pandas' reader on many .dta variants
+uv run pytest   # cross-checks against pandas and pyreadstat on many .dta variants
 ```
 
 The package lives in `dta2parquet/` of the `stata_parquet_io` repo for now.

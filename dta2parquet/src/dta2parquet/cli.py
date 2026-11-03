@@ -107,6 +107,40 @@ def cmd_batch(a) -> int:
     return 1 if any(o.status == "failed" for o in outcomes) else 0
 
 
+def cmd_verify(a) -> int:
+    try:
+        from .verify import verify
+    except ImportError:  # pragma: no cover
+        print("verify needs pyreadstat: install the 'verify' extra, e.g.\n"
+              "  uv run --extra verify dta2parquet verify ...\n"
+              "  uv tool install 'dta2parquet[verify]'", file=sys.stderr)
+        return 2
+    pairs = []
+    if os.path.isdir(a.dta):
+        from .batch import plan_jobs
+
+        pairs = [(j.src, j.dst) for j in plan_jobs([a.dta], a.parquet)]
+    else:
+        pairs = [(a.dta, a.parquet)]
+    failed = 0
+    for dta, parquet in pairs:
+        if not os.path.exists(parquet):
+            print(f"MISSING: {parquet} (from {dta})")
+            failed += 1
+            continue
+        try:
+            rep = verify(dta, parquet, sample_rows=0 if a.all_rows else a.sample_rows, encoding=a.encoding)
+        except ImportError:
+            print("verify needs pyreadstat: install the 'verify' extra, e.g.\n"
+                  "  uv run --extra verify dta2parquet verify ...", file=sys.stderr)
+            return 2
+        print(rep.summary(), flush=True)
+        failed += not rep.ok
+    if len(pairs) > 1:
+        print(f"{len(pairs) - failed}/{len(pairs)} files verified OK")
+    return 1 if failed else 0
+
+
 def cmd_inspect(a) -> int:
     from .metadata import STATA_META_KEY
 
@@ -175,6 +209,23 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("-q", "--quiet", action="store_true", help="only print failures and the summary")
     _add_convert_options(p)
     p.set_defaults(func=cmd_batch)
+
+    p = sub.add_parser(
+        "verify",
+        help="independently re-read the .dta (with pyreadstat) and check the parquet's "
+             "metadata, schema and data",
+        description="Re-reads the .dta with pyreadstat (a separate implementation) and "
+                    "compares labels, value labels, formats, notes, types and sampled data "
+                    "with the parquet. Give a .dta and .parquet, or an input directory and "
+                    "the batch output directory.",
+    )
+    p.add_argument("dta", help=".dta file, or a directory of them")
+    p.add_argument("parquet", help=".parquet file, or the batch output directory")
+    p.add_argument("--sample-rows", type=int, default=30_000,
+                   help="rows compared per file, from start/middle/end (default: 30000)")
+    p.add_argument("--all-rows", action="store_true", help="compare every row (slow for big files)")
+    p.add_argument("--encoding", default=None)
+    p.set_defaults(func=cmd_verify)
 
     p = sub.add_parser("inspect", help="print the Stata metadata envelope of a .parquet "
                                        "(or what would be written for a .dta)")

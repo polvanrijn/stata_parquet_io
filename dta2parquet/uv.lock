@@ -37,6 +37,11 @@ dependencies = [
     { name = "pyarrow", version = "26.0.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
 
+[package.optional-dependencies]
+verify = [
+    { name = "pyreadstat" },
+]
+
 [package.dev-dependencies]
 dev = [
     { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -50,7 +55,9 @@ requires-dist = [
     { name = "numpy", specifier = ">=1.24" },
     { name = "polars", specifier = ">=1.30" },
     { name = "pyarrow", specifier = ">=16" },
+    { name = "pyreadstat", marker = "extra == 'verify'", specifier = ">=1.2" },
 ]
+provides-extras = ["verify"]
 
 [package.metadata.requires-dev]
 dev = [
