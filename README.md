@@ -135,6 +135,17 @@ uv run examples/python_stata_metadata.py python_made.parquet
 uv run examples/python_verify.py python_made.parquet stata_resaved.parquet
 ```
 
+### Bulk-converting `.dta` files from Python
+
+[`dta2parquet/`](dta2parquet) is a standalone uv project that converts
+`.dta` files to Parquet with the same embedded Stata metadata, much faster
+than a Stata loop. It can also spread a batch over several machines:
+
+```bash
+cd dta2parquet
+uv run dta2parquet batch /data/stata -o /data/parquet
+```
+
 ## Building from source
 
 See [BUILDING.md](BUILDING.md) for native builds, cross-compiling to Windows
