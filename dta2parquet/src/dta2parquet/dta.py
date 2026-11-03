@@ -17,6 +17,7 @@ from __future__ import annotations
 import mmap
 import os
 import struct
+from array import array
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -130,7 +131,7 @@ class DtaFile:
         """Index of the GSO (strL) section, built lazily.
 
         Returns (keys, starts, lengths, binary) as sorted numpy arrays, where
-        key = (v << 40) | o identifies the (variable, observation) pair a strL
+        key = (o << V_BITS) | v identifies the (variable, observation) pair a strL
         reference points to.
         """
         if self._strl_index is None:
@@ -142,7 +143,7 @@ class DtaFile:
         keys, _, _, binary = self.strl_index()
         if not binary.any():
             return set()
-        return set((keys[binary] >> 40).astype(np.int64).tolist())
+        return set((keys[binary] & np.uint64((1 << V_BITS) - 1)).astype(np.int64).tolist())
 
 
 # ======================================================================
@@ -452,43 +453,60 @@ def _parse_vl_table(tab: bytes, bo: str, enc: str) -> dict[int, str]:
     return out
 
 
+# strL lookup key: (o << V_BITS) | v. Observation-major, because Stata writes
+# the GSO table row by row - so the parsed index is normally already sorted.
+# v (variable number) < 2**24 covers format 119's maximum; o < 2**40 obs.
+V_BITS = 24
+
+
 def _parse_gso(dta: DtaFile):
-    """Scan the <strls> section, recording payload positions (not payloads)."""
-    keys, starts, lens, binary = [], [], [], []
+    """Scan the <strls> section, recording payload positions (not payloads).
+
+    Reads the GSO headers straight from the memory map into typed arrays
+    (~25 bytes per stored strL), so files with tens of millions of strLs
+    stay fast and small.
+    """
     if dta.strl_offset is None:
         e = np.empty(0, np.uint64)
         return e, np.empty(0, np.int64), np.empty(0, np.int64), np.empty(0, bool)
-    buf = dta._buf
-    c = _Cursor(buf, dta.strl_offset, dta.byteorder)
-    c.expect(b"<strls>")
-    osize = 4 if dta.release == 117 else 8
-    while c.peek(3) == b"GSO":
-        c.pos += 3
-        v = c.u(4)
-        o = c.u(osize)
-        t = c.u(1)
-        ln = c.u(4)
-        start = c.pos
-        c.pos += ln
-        is_bin = t == 129
-        if not is_bin and ln > 0 and buf[start + ln - 1] == 0:
-            ln -= 1
-        keys.append((v << 40) | o)
-        starts.append(start)
-        lens.append(ln)
-        binary.append(is_bin)
-    keys_a = np.array(keys, dtype=np.uint64)
-    order = np.argsort(keys_a, kind="stable")
-    return (
-        keys_a[order],
-        np.array(starts, dtype=np.int64)[order],
-        np.array(lens, dtype=np.int64)[order],
-        np.array(binary, dtype=bool)[order],
-    )
+    mm = dta._mm
+    pos = dta.strl_offset
+    if mm[pos : pos + 7] != b"<strls>":
+        raise DtaFormatError(f"expected b'<strls>' at {pos}")
+    pos += 7
+    hdr = struct.Struct(dta.byteorder + ("3sIIBI" if dta.release == 117 else "3sIQBI"))
+    unpack, size, end = hdr.unpack_from, hdr.size, len(mm)
+    keys, starts, lens, binary = array("Q"), array("q"), array("q"), array("b")
+    k_app, s_app, l_app, b_app = keys.append, starts.append, lens.append, binary.append
+    while pos + size <= end:
+        tag, v, o, t, ln = unpack(mm, pos)
+        if tag != b"GSO":
+            break
+        start = pos + size
+        pos = start + ln
+        if pos > end:
+            raise DtaFormatError("unexpected end of file in strLs (truncated file?)")
+        if t == 129:
+            b_app(1)
+        else:
+            b_app(0)
+            if ln and mm[pos - 1] == 0:
+                ln -= 1  # text strLs carry a trailing NUL
+        k_app((o << V_BITS) | v)
+        s_app(start)
+        l_app(ln)
+    keys_a = np.frombuffer(keys, dtype=np.uint64)
+    starts_a = np.frombuffer(starts, dtype=np.int64)
+    lens_a = np.frombuffer(lens, dtype=np.int64)
+    bin_a = np.frombuffer(binary, dtype=np.int8).astype(bool)
+    if keys_a.size > 1 and not (keys_a[1:] > keys_a[:-1]).all():
+        order = np.argsort(keys_a, kind="stable")
+        keys_a, starts_a, lens_a, bin_a = keys_a[order], starts_a[order], lens_a[order], bin_a[order]
+    return keys_a, starts_a, lens_a, bin_a
 
 
 def strl_refs_to_keys(raw8: np.ndarray, release: int, byteorder: str) -> np.ndarray:
-    """Turn (n, 8) uint8 strL reference cells into (v << 40) | o keys."""
+    """Turn (n, 8) uint8 strL reference cells into (o << V_BITS) | v keys."""
     x = np.ascontiguousarray(raw8).view(byteorder + "u8").reshape(-1).astype(np.uint64)
     vbits = {117: 32, 118: 16, 119: 24}[release]
     if byteorder == "<":
@@ -497,4 +515,4 @@ def strl_refs_to_keys(raw8: np.ndarray, release: int, byteorder: str) -> np.ndar
     else:
         v = x >> np.uint64(64 - vbits)
         o = x & np.uint64((1 << (64 - vbits)) - 1)
-    return (v << np.uint64(40)) | o
+    return (o << np.uint64(V_BITS)) | v

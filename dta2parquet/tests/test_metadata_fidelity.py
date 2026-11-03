@@ -169,3 +169,94 @@ def test_variable_and_dataset_notes(tmp_path):
     assert rep.ok, rep.summary()
     assert any("2 variable(s) carry notes" in u for u in rep.unverifiable)
     assert any("_pq_parquet_name" in u for u in rep.unverifiable)
+
+
+# ------------------------------------------------------- schema conformance
+STATA_TYPES = {"byte", "int", "long", "float", "double", "date", "time", "datetime"}
+VAR_FIELDS = {"label": str, "value_label": str, "notes": list, "format": str, "stata_type": str}
+
+
+def assert_conforms(env: dict, table: pa.Table):
+    """The envelope schema from examples/python_stata_metadata.py, strictly:
+    every field but version optional and omitted rather than empty."""
+    assert set(env) <= {"version", "dataset_label", "dataset_notes", "variables", "value_labels"}
+    assert env["version"] == 1
+    for key in ("dataset_label", "dataset_notes", "variables", "value_labels"):
+        if key in env:
+            assert env[key] not in ("", [], {}, None), f"empty {key} must be omitted"
+    if "dataset_label" in env:
+        assert isinstance(env["dataset_label"], str)
+    for n in env.get("dataset_notes", []):
+        assert isinstance(n, str)
+    vls = env.get("value_labels", {})
+    for col, var in env.get("variables", {}).items():
+        assert col in table.column_names, f"{col}: not a parquet column name"
+        assert set(var) <= set(VAR_FIELDS), f"{col}: unknown fields {set(var) - set(VAR_FIELDS)}"
+        for k, typ in VAR_FIELDS.items():
+            if k in var:
+                assert isinstance(var[k], typ) and var[k] not in ("", []), f"{col}.{k} empty or wrong type"
+        assert all(isinstance(n, str) for n in var.get("notes", []))
+        t = table.schema.field(col).type
+        is_text = pa.types.is_string(t) or pa.types.is_large_string(t) or pa.types.is_binary(t) \
+            or pa.types.is_large_binary(t)
+        if is_text:
+            assert "stata_type" not in var, f"{col}: string columns carry no stata_type"
+            assert "value_label" not in var, f"{col}: value labels apply only to numeric columns"
+        else:
+            assert var.get("stata_type") in STATA_TYPES, f"{col}: stata_type {var.get('stata_type')!r}"
+        if "value_label" in var:
+            assert var["value_label"] in vls, f"{col}: value label {var['value_label']!r} not defined"
+    for name, codes in vls.items():
+        assert isinstance(name, str) and name and codes
+        for code, text in codes.items():
+            # codes are strings holding integers (or .a-.z / . for missing)
+            assert isinstance(code, str) and isinstance(text, str)
+            assert code.lstrip("-").isdigit() or code in {"."} | {"." + c for c in "abcdefghijklmnopqrstuvwxyz"}, code
+
+
+def _example_reader():
+    import importlib.util
+
+    path = os.path.join(os.path.dirname(__file__), "..", "..", "examples", "python_stata_metadata.py")
+    if not os.path.exists(path):
+        return None
+    spec = importlib.util.spec_from_file_location("python_stata_metadata", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.read_stata_metadata
+
+
+def _all_conversions(tmp_path):
+    import glob
+
+    import pandas as pd
+
+    srcs = sorted(glob.glob(os.path.join(os.path.dirname(__file__), "..", "..", "test_data", "*", "*.dta")))
+    rich_src = tmp_path / "rich.dta"
+    make_rich_dta(str(rich_src), n=200)
+    srcs.append(str(rich_src))
+    strl_src = tmp_path / "strl.dta"
+    pd.DataFrame({"t": ["x" * 3000, "y"], "s": ["a", "b"]}).to_stata(
+        strl_src, write_index=False, version=118, convert_strl=["t"])
+    srcs.append(str(strl_src))
+    notes_src = tmp_path / "notes.dta"
+    pd.DataFrame({"a": [1, 2]}).to_stata(notes_src, write_index=False, version=118)
+    add_characteristics(notes_src, [("_dta", "note0", "1"), ("_dta", "note1", "n"),
+                                    ("a", "note0", "1"), ("a", "note1", "m")])
+    srcs.append(str(notes_src))
+    for i, src in enumerate(srcs):
+        out = tmp_path / f"{i}.parquet"
+        convert_file(src, out)
+        yield src, str(out)
+
+
+def test_every_output_conforms_to_the_schema(tmp_path):
+    reader = _example_reader()
+    n = 0
+    for src, out in _all_conversions(tmp_path):
+        env = _env(out)
+        assert_conforms(env, pq.read_table(out))
+        if reader is not None:  # the repo's own example reads it back identically
+            assert reader(out) == env, src
+        n += 1
+    assert n >= 4

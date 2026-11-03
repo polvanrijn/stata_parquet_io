@@ -144,9 +144,9 @@ def test_pandas_written(version, byteorder, engine, tmp_path):
     assert env["value_labels"]["lab"] == dict(sorted(codes.items()))
     assert env["variables"]["dt"]["stata_type"] == "date"
     assert env["variables"]["ts"]["stata_type"] == "datetime"
-    assert env["variables"]["s"]["stata_type"] == "string"
+    assert "stata_type" not in env["variables"]["s"]  # strings carry none (schema)
     if with_strl:
-        assert env["variables"]["long_text"]["stata_type"] == "strl"
+        assert "stata_type" not in env["variables"]["long_text"]
         assert t.column("long_text").to_pylist() == df["long_text"].tolist()
 
 

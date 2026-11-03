@@ -111,7 +111,13 @@ def build_envelope(dta: DtaFile, column_names: list[str]) -> dict:
             entry["notes"] = notes
         if var.format:
             entry["format"] = var.format
-        entry["stata_type"] = resolve_stata_type(var)
+        stata_type = resolve_stata_type(var)
+        # The schema (and the Rust struct's doc) define stata_type only for
+        # numeric/date/time columns; string and strL columns carry none.
+        # (pq save currently also writes "string"/"strl" here; pq use ignores
+        # stata_type for anything but integer columns, so both read the same.)
+        if stata_type not in ("string", "strl"):
+            entry["stata_type"] = stata_type
         variables[col] = entry
 
     if variables:

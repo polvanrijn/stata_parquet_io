@@ -92,7 +92,7 @@ def _rs_code(code) -> str:
 def _expected_kind(rs_type: str, fmt: str) -> str:
     """Stata type pq save records, from readstat's storage type + format."""
     if rs_type == "string":
-        return "string|strl"
+        return ""  # strings carry no stata_type in the schema
     st = _RS_TYPES[rs_type]
     if st == "byte":
         return "byte"
@@ -148,7 +148,7 @@ def _check_metadata(rep: Report, meta, env: dict, colmap: dict[str, str]) -> Non
         rep.expect(v.get("format") == (fmt or None), f"{name}: format dta={fmt!r} parquet={v.get('format')!r}")
         exp = _expected_kind(meta.readstat_variable_types[name], fmt)
         got = v.get("stata_type")
-        rep.expect(got in exp.split("|"), f"{name}: stata_type {got!r}, expected {exp!r}")
+        rep.expect(got == (exp or None), f"{name}: stata_type {got!r}, expected {exp or None!r}")
         vl = meta.variable_to_label.get(name)
         rep.expect(v.get("value_label") == vl, f"{name}: value label dta={vl!r} parquet={v.get('value_label')!r}")
         if vl:
@@ -287,7 +287,8 @@ def verify(dta_path: str, parquet_path: str, sample_rows: int = 20_000, encoding
     kinds = {}
     for name in meta.column_names:
         col = colmap.get(name, name)
-        kind = env.get("variables", {}).get(col, {}).get("stata_type", "double")
+        # no stata_type = string column ("strl" accepts every string/binary type)
+        kind = env.get("variables", {}).get(col, {}).get("stata_type") or "strl"
         kinds[name] = kind
         if col in schema.names:
             t = schema.field(col).type

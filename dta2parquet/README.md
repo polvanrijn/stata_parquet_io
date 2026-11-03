@@ -17,11 +17,13 @@ restores everything, and other tools can read it too.
   |-----------------------------------|-------------|------------------------------------|------------------------|
   | 650 MB (5M rows × 29 columns)     | 3–4 s       | 21.6 s                             | 44.8 s                 |
   | 2.6 GB (20M rows × 29 columns)    | 9 s         | not run                            | not run                |
+  | 10.1 GB (80M rows × 29 columns)   | 31 s        | not run                            | not run                |
 
 * **Bounded memory.** It works through the file in chunks (`--chunk-mb`,
   64 MB by default), so files bigger than RAM are fine. Peak memory stays
   around 1 GB per file with the defaults and 4 threads: about 0.95 GB for the
-  650 MB file and 1.1 GB for the 2.6 GB one. Lower `--chunk-mb` or
+  650 MB file, 1.1 GB for the 2.6 GB one and 1.15 GB for the 10 GB one.
+  See "Very large files" below. Lower `--chunk-mb` or
   `--threads` if you run many files at once on a small machine.
 * **Scales out.** `batch` converts many files in parallel, and several
   machines can share the work (see below).
@@ -163,7 +165,9 @@ Column types follow `pq save` exactly (`src/mapping.rs` in this repo):
 | numeric with a time-of-day format (`hh:mm`)   | time64[ns]                                |
 | missing `.`, `.a` … `.z`                      | null                                      |
 
-The metadata envelope matches what `pq save, statametadata` writes:
+The metadata follows the envelope schema documented in
+[`examples/python_stata_metadata.py`](../examples/python_stata_metadata.py),
+which `pq use` reads:
 
 ```json
 {"version":1,"dataset_label":"…","dataset_notes":["…"],
@@ -172,9 +176,25 @@ The metadata envelope matches what `pq save, statametadata` writes:
  "value_labels":{"inc_lbl":{"1":"low","2":"high",".a":"refused"}}}
 ```
 
-This includes the same key order and compact serialization, the
-`_pq_parquet_name` characteristic and `{parquet_name:…}` label renames, and
-value labels on extended missing values (`.a` … `.z`).
+* Every field except `version` is left out when empty, never written as an
+  empty value.
+* `variables` is keyed by the Parquet column name. That covers the
+  `_pq_parquet_name` characteristic and `{parquet_name:…}` label renames.
+* Value-label codes are strings holding integers, plus `.` and `.a` … `.z`
+  for labels on missing values.
+* `stata_type` is one of `byte int long float double date time datetime`.
+  String and strL columns have none.
+* Key order and compact serialization match what `pq save` writes (Rust
+  serde).
+
+The test suite checks every output against this schema strictly. It also
+reads every output back with that example's own `read_stata_metadata`.
+
+One difference from `pq save` as it is now: `pq save` also writes
+`"stata_type":"string"`/`"strl"` for text columns, which contradicts the
+schema and the doc comment on `VariableMetadata.stata_type` in
+`src/stata_metadata.rs`. `pq use` only uses `stata_type` for integer
+columns, so both forms load the same.
 
 Things to know:
 
@@ -188,6 +208,40 @@ Things to know:
 * Value-label codes are written as plain integers (`"1000000000"`). Stata's
   own `pq save` formats them with Mata `strofreal`, which can switch to
   exponent notation for codes with very many digits.
+
+## Very large files (tens of GB)
+
+Nothing is ever loaded whole:
+
+* rows are read in sequential chunks;
+* the strL index is about 25 bytes per stored strL;
+* the Parquet file is written as a stream.
+
+Measured on a 4-core VM with a 10 GB file (80M rows), conversion ran at
+about 330 MB/s with peak memory of 1.15 GB. Memory stayed nearly flat
+through the run. So expect roughly 1–1.5 GB of memory per file and 1–2
+minutes per 30 GB on a similar machine, if storage keeps up.
+
+In practice, storage decides the speed:
+
+* reading the `.dta` and writing roughly 80% of its size back as Parquet;
+* on NFS over 1 GbE that is about 110 MB/s, so 5+ minutes per 30 GB file;
+* when many machines read from one file server, the server's bandwidth
+  is the limit, not the number of machines.
+
+Other notes:
+
+* **Temp space:** each output is written to a temp file next to it, so the
+  output folder needs room for the Parquet file being written.
+* **strLs are slower:** text is gathered in a Python loop. A file with
+  2 million strLs converted at about 35 MB/s. Plain `str#` columns don't
+  have this cost.
+* **One file, one machine:** a single file is converted by one machine,
+  using all its cores via `--threads`. Several machines only help when there
+  are several files.
+* **Spot-checking:** `verify` reads only the sampled rows (seeking, not
+  scanning), so checking a 10 GB file takes seconds.
+  `--sample-rows 300000` took 6 s.
 
 ## Development
 
