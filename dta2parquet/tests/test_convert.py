@@ -331,3 +331,15 @@ def test_chunk_size_accounts_for_strl_payload(tmp_path):
     with open_dta(src) as d:
         # 8-byte refs alone would allow 64 MB / 8 = millions of rows per chunk
         assert C._rows_per_group(d, ConvertOptions(chunk_bytes=1_000_000)) == 9
+
+
+def test_cli_batch_log_in_new_output_dir(tmp_path):
+    from dta2parquet.cli import main
+
+    src = tmp_path / "in"
+    src.mkdir()
+    _frame(20).to_stata(src / "a.dta", write_index=False, version=118)
+    out = tmp_path / "out"
+    assert main(["batch", str(src), "-o", str(out), "--log", str(out / "log.jsonl"), "-j", "1"]) == 0
+    rec = json.loads((out / "log.jsonl").read_text())
+    assert rec["status"] == "done" and rec["result"]["rows"] == 20

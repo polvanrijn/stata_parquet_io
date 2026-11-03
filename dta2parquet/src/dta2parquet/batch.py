@@ -256,7 +256,10 @@ def run_batch(
     quiet: bool = False,
 ) -> list[Outcome]:
     outcomes: list[Outcome] = []
-    log = open(log_path, "a") if log_path else None
+    log = None
+    if log_path:
+        os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
+        log = open(log_path, "a")  # noqa: SIM115 - closed in the finally below
     t0 = time.perf_counter()
     total = len(jobs)
 
